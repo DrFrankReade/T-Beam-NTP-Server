@@ -404,6 +404,8 @@ static bool applySettingsJson(JsonDocument &doc) {
   return true;
 }
 
+static String expandedApSsid();
+
 static void settingsToJson(JsonDocument &doc) {
   doc["hostname"] = settings.hostname;
 
@@ -425,6 +427,7 @@ static void settingsToJson(JsonDocument &doc) {
   ap["subnet"] = ipToString(settings.apSubnet);
   ap["channel"] = settings.apChannel;
   ap["maxClients"] = settings.apMaxClients;
+  ap["expandedSsid"] = expandedApSsid();
 
   JsonObject standalone = doc.createNestedObject("standalone");
   standalone["dhcpOption42"] = settings.dhcpOption42;
@@ -1358,20 +1361,20 @@ label{display:block;font-weight:650;margin-bottom:4px}input,select,textarea,butt
 input[type=checkbox]{width:auto;margin-right:8px}.check{display:flex;align-items:center;min-height:39px;color:var(--ink);font-weight:650}.actions{display:flex;gap:10px;flex-wrap:wrap}.actions button{width:auto;min-width:120px}
 button{background:#e8eef6;cursor:pointer;font-weight:700}button.primary{background:var(--accent);border-color:var(--accent);color:#fff}button.secondary{background:#eaf0ff;border-color:#c6d4ff;color:#173b87}button.danger{background:#fff0f0;border-color:#ffc7c7;color:var(--bad)}
 .status{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.metric{border:1px solid var(--line);border-radius:8px;padding:10px;background:#fbfcfd}.metric b{display:block;font-size:12px;color:var(--muted);margin-bottom:3px}.metric span{font-size:15px}
-.ok{color:var(--accent)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted{color:var(--muted);font-size:12px}.hidden{display:none}
+.ok{color:var(--accent)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted,.hint{color:var(--muted);font-size:12px}.hint{margin-top:5px;line-height:1.3}.hidden{display:none}
 @media(max-width:820px){.grid{grid-template-columns:1fr}.span3,.span4,.span6,.span8,.span12{grid-column:span 1}.status{grid-template-columns:1fr 1fr}.actions button{width:100%}}
 </style>
 </head>
 <body>
-<header><h1>T-Beam NTP</h1><div class="meta" id="topline">Loading</div></header>
+<header><h1 title="GPS/PPS disciplined NTP server status and configuration">T-Beam NTP</h1><div class="meta" id="topline">Loading</div></header>
 <main>
-<section><h2>Status</h2><div class="status" id="status"></div></section>
-<section><h2>Network</h2><div class="grid">
-<div class="span6"><label for="staSsid">Home SSID</label><input id="staSsid" list="scanList"></div>
+<section><h2 title="Live clock, GPS, network, power, and memory state">Status</h2><div class="status" id="status"></div></section>
+<section><h2 title="Settings used when the T-Beam joins an existing WiFi network">Network</h2><div class="grid">
+<div class="span6"><label for="staSsid">Home SSID</label><input id="staSsid" list="scanList" maxlength="32"></div>
 <div class="span3"><label>&nbsp;</label><button class="secondary" id="scanBtn">Scan</button></div>
-<div class="span3"><label for="staPass">Home password</label><input id="staPass" type="password"></div>
+<div class="span3"><label for="staPass">Home password</label><input id="staPass" type="password" maxlength="64"></div>
 <datalist id="scanList"></datalist>
-<div class="span4"><label for="hostname">Hostname</label><input id="hostname"></div>
+<div class="span4"><label for="hostname">Hostname</label><input id="hostname" maxlength="31"></div>
 <div class="span4 check"><input id="staDhcp" type="checkbox">Use DHCP</div>
 <div class="span4"><label for="connectTimeout">Connect timeout seconds</label><input id="connectTimeout" type="number" min="5" max="90"></div>
 <div class="span3"><label for="staticIp">Static IP</label><input id="staticIp"></div>
@@ -1379,9 +1382,9 @@ button{background:#e8eef6;cursor:pointer;font-weight:700}button.primary{backgrou
 <div class="span3"><label for="subnet">Subnet</label><input id="subnet"></div>
 <div class="span3"><label for="dns1">DNS 1</label><input id="dns1"></div>
 </div></section>
-<section><h2>Standalone AP</h2><div class="grid">
-<div class="span4"><label for="apSsid">AP SSID</label><input id="apSsid"></div>
-<div class="span4"><label for="apPass">AP password</label><input id="apPass" type="password"></div>
+<section><h2 title="Settings used when the T-Beam is its own off-grid WiFi network">Standalone AP</h2><div class="grid">
+<div class="span4"><label for="apSsid">AP SSID</label><input id="apSsid" maxlength="32" aria-describedby="apSsidNote"><div class="hint" id="apSsidNote">Use {mac} to insert this unit's last six MAC hex digits.</div></div>
+<div class="span4"><label for="apPass">AP password</label><input id="apPass" type="password" maxlength="64"></div>
 <div class="span2"><label for="apChannel">Channel</label><input id="apChannel" type="number" min="1" max="13"></div>
 <div class="span2"><label for="apMax">Max clients</label><input id="apMax" type="number" min="1" max="10"></div>
 <div class="span3"><label for="apIp">AP IP</label><input id="apIp"></div>
@@ -1391,7 +1394,7 @@ button{background:#e8eef6;cursor:pointer;font-weight:700}button.primary{backgrou
 <div class="span3 check"><input id="dnsWildcard" type="checkbox">Captive DNS wildcard</div>
 <div class="span12"><label for="ntpHosts">NTP host aliases</label><textarea id="ntpHosts" spellcheck="false"></textarea></div>
 </div></section>
-<section><h2>Time, Display, And Power</h2><div class="grid">
+<section><h2 title="Local display time, OLED behavior, and AXP192 battery/USB power settings">Time, Display, And Power</h2><div class="grid">
 <div class="span3 check"><input id="observeDst" type="checkbox">Use POSIX TZ/DST</div>
 <div class="span6"><label for="posixTimezone">POSIX TZ rule</label><input id="posixTimezone" maxlength="95"></div>
 <div class="span3 check"><input id="autoOffset" type="checkbox">Auto fallback offset</div>
@@ -1413,16 +1416,78 @@ button{background:#e8eef6;cursor:pointer;font-weight:700}button.primary{backgrou
 <script>
 const $=id=>document.getElementById(id);
 let current={};
-function metric(k,v,c=''){return `<div class="metric"><b>${k}</b><span class="${c}">${v??''}</span></div>`}
+const tips={
+topline:'Live summary of network mode, device IP, UTC/local time, and connected AP clients.',
+status:'Live operational metrics. Each metric tile also has its own tooltip.',
+staSsid:'SSID of the existing WiFi network to join in LAN mode. Leave blank to stay in standalone AP mode.',
+scanBtn:'Scan nearby WiFi networks and populate the Home SSID drop-down.',
+staPass:'Password for the selected home WiFi network. It is saved only when you press Save.',
+scanList:'Nearby WiFi networks discovered by the last scan.',
+hostname:'Hostname used on the LAN and for mDNS services. Keep it short, unique, and DNS-safe.',
+staDhcp:'Use the router DHCP lease in LAN mode. Turn this off only when you want a fixed IPv4 address.',
+connectTimeout:'How long to try joining home WiFi before falling back to standalone AP mode.',
+staticIp:'Fixed IPv4 address to use when DHCP is disabled.',
+gateway:'IPv4 gateway for static LAN mode. Usually the router address.',
+subnet:'Subnet mask for static LAN mode, normally 255.255.255.0 on small networks.',
+dns1:'DNS server used by the T-Beam in LAN mode when static addressing is selected.',
+apSsid:'Standalone AP network name. The literal token {mac} is replaced with the last six MAC hex digits for this unit before the AP starts.',
+apSsidNote:'Shows the AP SSID after {mac} expansion, using the value reported by the firmware.',
+apPass:'Standalone AP password. Leave blank for an open field network, or use at least 8 characters for WPA.',
+apChannel:'2.4 GHz WiFi channel for standalone AP mode. Use 1, 6, or 11 when avoiding overlap.',
+apMax:'Maximum SoftAP stations allowed. Higher values increase management and buffer pressure.',
+apIp:'IPv4 address of the T-Beam in standalone AP mode. DHCP, DNS, portal, and NTP use this address.',
+apSubnet:'Subnet mask handed to standalone AP clients by the DHCP server.',
+opt42:'Advertise the T-Beam AP IP as the NTP server with DHCP option 42.',
+dnsAliases:'Answer configured NTP hostnames with the T-Beam AP IP so clients already pointed at public time servers still work off-grid.',
+dnsWildcard:'Answer other DNS names with the T-Beam AP IP for captive portal discovery and easier onboarding.',
+ntpHosts:'One NTP hostname per line. These names are answered locally by DNS in standalone AP mode.',
+observeDst:'Use the POSIX TZ rule for local display time, including daylight-saving transitions.',
+posixTimezone:'POSIX timezone rule for local display time. Example: PST8PDT,M3.2.0/2,M11.1.0/2.',
+autoOffset:'Fallback only when POSIX TZ/DST is disabled: estimate local offset from GPS longitude.',
+manualOffset:'Fallback only when POSIX TZ/DST and auto fallback are disabled. Minutes east of UTC are positive.',
+chargeEnabled:'Allow AXP192 battery charging using the configured current and voltage limits.',
+chargeCurrent:'Li-Ion charge current limit. Conservative values reduce heat and battery stress.',
+chargeVoltage:'Li-Ion charge termination voltage. 4100 mV is conservative; 4200 mV maximizes capacity.',
+vbusLimit:'USB/VBUS input current limit. Use 500 mA for normal USB ports, 100 mA for weak sources, Off to disable the limiter.',
+warnVoltage:'Battery voltage that marks the power state as warning while discharging.',
+cutoffVoltage:'Battery voltage that requests PMU shutdown while discharging after the debounce interval.',
+sysDown:'AXP192 system power-down threshold. Keep below the battery cutoff setting.',
+powerKey:'AXP192 long-press duration for PMU power-off behavior.',
+oledCycle:'Automatically rotate OLED status screens.',
+oledCycleSeconds:'Seconds each OLED screen remains visible while auto-cycle is enabled.',
+screenTimeout:'Seconds of no display activity before the OLED turns off. Use 0 to disable the screensaver.',
+saveBtn:'Write the displayed settings to LittleFS. The firmware avoids flash writes until this is pressed.',
+rebootBtn:'Restart the T-Beam. Network mode and AP settings take effect cleanly after reboot.',
+message:'Save, scan, and reboot status messages appear here.'
+};
+const metricTips={
+Mode:'Current network mode: AP for standalone service or STA for LAN client mode.',
+IP:'IPv4 address currently serving the portal and NTP.',
+UTC:'GPS-derived UTC time. NTP uses UTC and ignores local timezone settings.',
+Local:'Display-only local time after POSIX TZ/DST or fallback offset handling.',
+TZ:'Timezone abbreviation, daylight-saving state, or numeric fallback offset.',
+PPS:'Whether recent GPS PPS edges are disciplining the firmware clock.',
+GPS:'Fix quality summary with satellite count and Maidenhead grid when available.',
+Location:'Current GPS latitude and longitude when a fix is fresh.',
+Altitude:'GPS altitude in meters when available.',
+DOP:'Dilution of precision reported by the GPS receiver.',
+Battery:'AXP192 battery presence, voltage, and charge/discharge current.',
+VBUS:'USB/VBUS voltage and current reported by the AXP192.',
+'NTP/DNS':'NTP requests, suppressed NTP requests, and DNS query count.',
+Heap:'Available ESP32 heap and PSRAM for stability monitoring.'
+};
+function escAttr(s){return String(s??'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function metric(k,v,c='',tip=''){return `<div class="metric" title="${escAttr(tip||metricTips[k]||k)}"><b>${k}</b><span class="${c}">${v??''}</span></div>`}
+function applyTooltips(){Object.keys(tips).forEach(id=>{const el=$(id);if(!el)return;el.title=tips[id];const label=document.querySelector(`label[for="${id}"]`);if(label)label.title=tips[id];const wrap=el.closest('.check');if(wrap)wrap.title=tips[id]})}
 function offsetLabel(m){const s=m>=0?'+':'-';const a=Math.abs(m||0);return `UTC${s}${String(Math.floor(a/60)).padStart(2,'0')}:${String(a%60).padStart(2,'0')}`}
 async function getJson(url,opts){const r=await fetch(url,opts);if(!r.ok)throw new Error(await r.text());return r.json()}
 function setMsg(t,c=''){const el=$('message');el.textContent=t;el.className='muted '+c}
 function fillSettings(s){
 current=s;const d=s.display||{},t=s.time||{};
-$('hostname').value=s.hostname||'';$('staSsid').value=s.wifi.ssid||'';$('staPass').value=s.wifi.password||'';$('staDhcp').checked=!!s.wifi.dhcp;$('staticIp').value=s.wifi.staticIp;$('gateway').value=s.wifi.gateway;$('subnet').value=s.wifi.subnet;$('dns1').value=s.wifi.dns1;$('connectTimeout').value=s.wifi.connectTimeoutSec;$('apSsid').value=s.ap.ssid;$('apPass').value=s.ap.password;$('apIp').value=s.ap.ip;$('apSubnet').value=s.ap.subnet;$('apChannel').value=s.ap.channel;$('apMax').value=s.ap.maxClients;$('opt42').checked=!!s.standalone.dhcpOption42;$('dnsAliases').checked=!!s.standalone.dnsNtpAliases;$('dnsWildcard').checked=!!s.standalone.dnsWildcardCaptive;$('ntpHosts').value=(s.standalone.ntpHosts||[]).join('\n');$('observeDst').checked=t.observeDst!==false;$('posixTimezone').value=t.posixTimezone||'PST8PDT,M3.2.0/2,M11.1.0/2';$('autoOffset').checked=!!t.autoLocalOffset;$('manualOffset').value=t.manualOffsetMinutes??0;$('chargeEnabled').checked=!!s.power.chargeEnabled;$('chargeCurrent').value=s.power.chargeCurrentMa;$('chargeVoltage').value=s.power.chargeTargetMv;$('vbusLimit').value=s.power.vbusCurrentLimitMa;$('warnVoltage').value=s.power.warningVoltageMv;$('cutoffVoltage').value=s.power.cutoffVoltageMv;$('sysDown').value=s.power.sysPowerDownMv;$('powerKey').value=s.power.powerKeyOffSeconds;$('oledCycle').checked=d.autoCycle!==false;$('oledCycleSeconds').value=d.cycleSeconds||5;$('screenTimeout').value=d.screensaverTimeoutSec??300}
+$('hostname').value=s.hostname||'';$('staSsid').value=s.wifi.ssid||'';$('staPass').value=s.wifi.password||'';$('staDhcp').checked=!!s.wifi.dhcp;$('staticIp').value=s.wifi.staticIp;$('gateway').value=s.wifi.gateway;$('subnet').value=s.wifi.subnet;$('dns1').value=s.wifi.dns1;$('connectTimeout').value=s.wifi.connectTimeoutSec;$('apSsid').value=s.ap.ssid;$('apPass').value=s.ap.password;$('apIp').value=s.ap.ip;$('apSubnet').value=s.ap.subnet;$('apChannel').value=s.ap.channel;$('apMax').value=s.ap.maxClients;$('opt42').checked=!!s.standalone.dhcpOption42;$('dnsAliases').checked=!!s.standalone.dnsNtpAliases;$('dnsWildcard').checked=!!s.standalone.dnsWildcardCaptive;$('ntpHosts').value=(s.standalone.ntpHosts||[]).join('\n');$('observeDst').checked=t.observeDst!==false;$('posixTimezone').value=t.posixTimezone||'PST8PDT,M3.2.0/2,M11.1.0/2';$('autoOffset').checked=!!t.autoLocalOffset;$('manualOffset').value=t.manualOffsetMinutes??0;$('chargeEnabled').checked=!!s.power.chargeEnabled;$('chargeCurrent').value=s.power.chargeCurrentMa;$('chargeVoltage').value=s.power.chargeTargetMv;$('vbusLimit').value=s.power.vbusCurrentLimitMa;$('warnVoltage').value=s.power.warningVoltageMv;$('cutoffVoltage').value=s.power.cutoffVoltageMv;$('sysDown').value=s.power.sysPowerDownMv;$('powerKey').value=s.power.powerKeyOffSeconds;$('oledCycle').checked=d.autoCycle!==false;$('oledCycleSeconds').value=d.cycleSeconds||5;$('screenTimeout').value=d.screensaverTimeoutSec??300;const ex=s.ap.expandedSsid||s.ap.ssid||'';$('apSsidNote').textContent=`Use {mac} to insert this unit's last six MAC hex digits. Current AP SSID: ${ex}.`}
 function readSettings(){return{hostname:$('hostname').value,wifi:{ssid:$('staSsid').value,password:$('staPass').value,dhcp:$('staDhcp').checked,staticIp:$('staticIp').value,gateway:$('gateway').value,subnet:$('subnet').value,dns1:$('dns1').value,dns2:(current.wifi&&current.wifi.dns2)||'1.1.1.1',connectTimeoutSec:+$('connectTimeout').value},ap:{ssid:$('apSsid').value,password:$('apPass').value,ip:$('apIp').value,subnet:$('apSubnet').value,channel:+$('apChannel').value,maxClients:+$('apMax').value},standalone:{dhcpOption42:$('opt42').checked,dnsNtpAliases:$('dnsAliases').checked,dnsWildcardCaptive:$('dnsWildcard').checked,ntpHosts:$('ntpHosts').value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean)},time:{observeDst:$('observeDst').checked,posixTimezone:$('posixTimezone').value.trim(),autoLocalOffset:$('autoOffset').checked,manualOffsetMinutes:+$('manualOffset').value},display:{autoCycle:$('oledCycle').checked,cycleSeconds:+$('oledCycleSeconds').value,screensaverTimeoutSec:+$('screenTimeout').value},power:{chargeEnabled:$('chargeEnabled').checked,chargeCurrentMa:+$('chargeCurrent').value,chargeTargetMv:+$('chargeVoltage').value,vbusCurrentLimitMa:+$('vbusLimit').value,warningVoltageMv:+$('warnVoltage').value,cutoffVoltageMv:+$('cutoffVoltage').value,sysPowerDownMv:+$('sysDown').value,powerKeyOffSeconds:+$('powerKey').value}}}
 async function refreshStatus(){try{const s=await getJson('/api/status');$('topline').textContent=`${s.mode} ${s.ip} | UTC ${s.utc||'not synced'} | Local ${s.local||'not synced'} | clients ${s.clients}`;let gps=s.gps.fix?'ok':(s.gps.seen?'warn':'bad');let pwr=s.power.online?(s.power.warning?'warn':'ok'):'warn';let tz=s.timeZone?`${s.timeZone} ${s.dstActive?'DST':'STD'}`:offsetLabel(s.localOffsetMinutes);$('status').innerHTML=metric('Mode',s.mode)+metric('IP',s.ip)+metric('UTC',s.utc||'not synced',s.clock.synced?'ok':'bad')+metric('Local',s.local||'not synced',s.clock.synced?'ok':'bad')+metric('TZ',tz)+metric('PPS',s.clock.pps?'locked':'waiting',s.clock.pps?'ok':'warn')+metric('GPS',`${s.gps.sats} sats ${s.gps.grid||''}`,gps)+metric('Location',s.gps.fix?`${s.gps.lat.toFixed(6)}, ${s.gps.lon.toFixed(6)}`:'no fix')+metric('Altitude',s.gps.fix?`${s.gps.alt.toFixed(1)} m`:'')+metric('DOP',s.gps.dop||'')+metric('Battery',s.power.online?(s.power.batteryPresent?`${s.power.batteryMv} mV ${s.power.batteryCurrentMa.toFixed(0)} mA`:'no battery'):'PMU offline',pwr)+metric('VBUS',s.power.online?`${s.power.vbusMv} mV ${s.power.vbusCurrentMa.toFixed(0)} mA`:'')+metric('NTP/DNS',`${s.ntpRequests}/${s.ntpSuppressed} / ${s.dnsQueries}`)+metric('Heap',`${s.heap.free} free, PSRAM ${s.heap.psramFree}`)}catch(e){setMsg(e.message,'bad')}}
-async function load(){fillSettings(await getJson('/api/settings'));refreshStatus();setInterval(refreshStatus,2000)}
+async function load(){applyTooltips();fillSettings(await getJson('/api/settings'));refreshStatus();setInterval(refreshStatus,2000)}
 $('saveBtn').onclick=async()=>{try{setMsg('Saving');await getJson('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(readSettings())});setMsg('Saved. Reboot to apply network changes.','ok')}catch(e){setMsg(e.message,'bad')}};
 $('rebootBtn').onclick=async()=>{if(confirm('Reboot now?')){await fetch('/api/reboot',{method:'POST'});setMsg('Rebooting')}};
 $('scanBtn').onclick=async()=>{try{setMsg('Scanning');const s=await getJson('/api/scan');const list=$('scanList');list.innerHTML='';s.networks.forEach(n=>{const o=document.createElement('option');o.value=n.ssid;o.label=`${n.rssi} dBm ch ${n.channel}`;list.appendChild(o)});setMsg(`Found ${s.networks.length} networks`)}catch(e){setMsg(e.message,'bad')}};
