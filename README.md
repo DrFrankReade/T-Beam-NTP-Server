@@ -20,7 +20,7 @@ NTP itself is always UTC. Local time and daylight-saving settings only affect th
 
 ## Current Build
 
-- Firmware version: `v0.1.4`
+- Firmware version: `v0.1.5`
 - PlatformIO environment: `ttgo-t-beam`
 - Upload port: `COM28`
 - Filesystem: LittleFS, 1 MB at `0x300000`
@@ -49,10 +49,11 @@ Binary releases include:
 
 ## First Boot
 
-With no configured home WiFi, the device starts in AP mode:
+By default, the device starts in explicit Standalone AP Mode:
 
 - SSID: `TBeam-NTP-{mac}`
 - Password: `tbeam-ntp`
+- Security: WPA2-Personal
 - Default IP: `192.168.4.1`
 - Portal: `http://192.168.4.1/`
 - NTP: UDP/123 on the device IP
@@ -68,7 +69,9 @@ NTP intentionally fails closed: requests are counted but no NTP response is sent
 
 ## LAN Mode
 
-The T-Beam can also join an existing WiFi network. In that mode it serves NTP on its assigned or static IPv4 address. Your router or clients can then be configured to use the T-Beam IP or hostname as an NTP source. DHCP and DNS servers are inactive, since it's assumed that the local router will be handling these services.
+The T-Beam can also join an existing WiFi network by selecting Client Mode with AP Fallback in the portal and entering the Network Client SSID/password. In client mode it serves NTP on its assigned or static IPv4 address. Your router or clients can then be configured to use the T-Beam IP or hostname as an NTP source. DHCP and DNS servers are inactive, since it's assumed that the local router will be handling these services. If the client connection fails or is later lost, the device falls back to standalone AP mode.
+
+Standalone AP security is configurable as Open, WPA2-Personal, WPA/WPA2 legacy, WPA2/WPA3 transition, or WPA3-Personal. WEP is not exposed because ESP32 SoftAP mode does not support WEP.
 
 ## Hardware Assumptions
 

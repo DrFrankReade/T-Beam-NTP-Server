@@ -12,6 +12,7 @@
 
 #include <esp_timer.h>
 #include <esp_wifi.h>
+#include <esp_heap_caps.h>
 #include <stdlib.h>
 #include <sys/time.h>
 #include <time.h>
@@ -45,7 +46,7 @@ static constexpr uint8_t OLED_PAGE_COUNT = 7;
 static constexpr uint32_t USER_BUTTON_FACTORY_RESET_MS = 10000;
 static constexpr uint32_t FACTORY_RESET_CONFIRM_WINDOW_MS = 30000;
 static constexpr uint32_t OLED_MANUAL_CYCLE_PAUSE_MS = 30000;
-static constexpr const char *FIRMWARE_VERSION = "v0.1.4";
+static constexpr const char *FIRMWARE_VERSION = "v0.1.5";
 static constexpr const char *DEFAULT_POSIX_TZ = "PST8PDT,M3.2.0/2,M11.1.0/2";
 static constexpr const char *DEFAULT_IANA_TIME_ZONE = "America/Los_Angeles";
 static constexpr const char *DEFAULT_AP_PASSWORD = "tbeam-ntp";
@@ -56,6 +57,19 @@ enum class NetworkMode {
   Sta
 };
 
+enum class NetworkStartMode : uint8_t {
+  StandaloneAp,
+  ClientWithApFallback
+};
+
+enum class ApSecurityMode : uint8_t {
+  Open,
+  Wpa2,
+  WpaWpa2,
+  Wpa2Wpa3,
+  Wpa3
+};
+
 enum class LocalTimeMode : uint8_t {
   Offset,
   Iana,
@@ -64,6 +78,7 @@ enum class LocalTimeMode : uint8_t {
 
 struct DeviceSettings {
   char hostname[32];
+  NetworkStartMode networkStartMode;
 
   char staSsid[33];
   char staPassword[65];
@@ -77,6 +92,7 @@ struct DeviceSettings {
 
   char apSsid[33];
   char apPassword[65];
+  ApSecurityMode apSecurityMode;
   IPAddress apIp;
   IPAddress apSubnet;
   uint8_t apChannel;
@@ -190,6 +206,22 @@ static uint32_t lastNmeaUpdateMs = 0;
 
 static void wakeOled();
 
+struct PsramJsonAllocator {
+  void *allocate(size_t size) {
+    return heap_caps_malloc_prefer(size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_8BIT);
+  }
+
+  void deallocate(void *pointer) {
+    heap_caps_free(pointer);
+  }
+
+  void *reallocate(void *pointer, size_t newSize) {
+    return heap_caps_realloc_prefer(pointer, newSize, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_8BIT);
+  }
+};
+
+using PsramJsonDocument = BasicJsonDocument<PsramJsonAllocator>;
+
 static void copyText(char *dst, size_t len, const char *src) {
   if (len == 0) {
     return;
@@ -198,6 +230,106 @@ static void copyText(char *dst, size_t len, const char *src) {
     src = "";
   }
   snprintf(dst, len, "%s", src);
+}
+
+static const char *networkStartModeName(NetworkStartMode mode) {
+  switch (mode) {
+    case NetworkStartMode::StandaloneAp:
+      return "standaloneAp";
+    case NetworkStartMode::ClientWithApFallback:
+      return "clientWithApFallback";
+  }
+  return "standaloneAp";
+}
+
+static NetworkStartMode parseNetworkStartMode(const char *text, NetworkStartMode fallback) {
+  if (!text) {
+    return fallback;
+  }
+  if (strcmp(text, "standaloneAp") == 0 || strcmp(text, "standalone") == 0) {
+    return NetworkStartMode::StandaloneAp;
+  }
+  if (strcmp(text, "clientWithApFallback") == 0 || strcmp(text, "client") == 0) {
+    return NetworkStartMode::ClientWithApFallback;
+  }
+  return fallback;
+}
+
+static const char *apSecurityModeName(ApSecurityMode mode) {
+  switch (mode) {
+    case ApSecurityMode::Open:
+      return "open";
+    case ApSecurityMode::Wpa2:
+      return "wpa2";
+    case ApSecurityMode::WpaWpa2:
+      return "wpa-wpa2";
+    case ApSecurityMode::Wpa2Wpa3:
+      return "wpa2-wpa3";
+    case ApSecurityMode::Wpa3:
+      return "wpa3";
+  }
+  return "wpa2";
+}
+
+static ApSecurityMode parseApSecurityMode(const char *text, ApSecurityMode fallback) {
+  if (!text) {
+    return fallback;
+  }
+  if (strcmp(text, "open") == 0) {
+    return ApSecurityMode::Open;
+  }
+  if (strcmp(text, "wpa") == 0 || strcmp(text, "wpa-wpa2") == 0) {
+    return ApSecurityMode::WpaWpa2;
+  }
+  if (strcmp(text, "wpa2-wpa3") == 0) {
+    return ApSecurityMode::Wpa2Wpa3;
+  }
+  if (strcmp(text, "wpa3") == 0) {
+    return ApSecurityMode::Wpa3;
+  }
+  if (strcmp(text, "wpa2") == 0) {
+    return ApSecurityMode::Wpa2;
+  }
+  return fallback;
+}
+
+static wifi_auth_mode_t apWifiAuthMode(ApSecurityMode mode) {
+  switch (mode) {
+    case ApSecurityMode::Open:
+      return WIFI_AUTH_OPEN;
+    case ApSecurityMode::WpaWpa2:
+      return WIFI_AUTH_WPA_WPA2_PSK;
+    case ApSecurityMode::Wpa2Wpa3:
+      return WIFI_AUTH_WPA2_WPA3_PSK;
+    case ApSecurityMode::Wpa3:
+      return WIFI_AUTH_WPA3_PSK;
+    case ApSecurityMode::Wpa2:
+      return WIFI_AUTH_WPA2_PSK;
+  }
+  return WIFI_AUTH_WPA2_PSK;
+}
+
+static const char *wifiAuthModeLabel(wifi_auth_mode_t mode) {
+  switch (mode) {
+    case WIFI_AUTH_OPEN:
+      return "Open";
+    case WIFI_AUTH_WEP:
+      return "WEP";
+    case WIFI_AUTH_WPA_PSK:
+      return "WPA";
+    case WIFI_AUTH_WPA2_PSK:
+      return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK:
+      return "WPA/WPA2";
+    case WIFI_AUTH_WPA3_PSK:
+      return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK:
+      return "WPA2/WPA3";
+    case WIFI_AUTH_WAPI_PSK:
+      return "WAPI";
+    default:
+      return "Unknown";
+  }
 }
 
 static void copyPosixTimezone(char *dst, size_t len, const char *src) {
@@ -354,6 +486,7 @@ static void addDefaultNtpHosts() {
 
 static void setHardDefaults() {
   copyText(settings.hostname, sizeof(settings.hostname), "tbeam-ntp");
+  settings.networkStartMode = NetworkStartMode::StandaloneAp;
   copyText(settings.staSsid, sizeof(settings.staSsid), "");
   copyText(settings.staPassword, sizeof(settings.staPassword), "");
   settings.staDhcp = true;
@@ -366,6 +499,7 @@ static void setHardDefaults() {
 
   copyText(settings.apSsid, sizeof(settings.apSsid), "TBeam-NTP-{mac}");
   copyText(settings.apPassword, sizeof(settings.apPassword), DEFAULT_AP_PASSWORD);
+  settings.apSecurityMode = ApSecurityMode::Wpa2;
   settings.apIp = IPAddress(192, 168, 4, 1);
   settings.apSubnet = IPAddress(255, 255, 255, 0);
   settings.apChannel = 6;
@@ -398,6 +532,12 @@ static void setHardDefaults() {
 }
 
 static bool applySettingsJson(JsonDocument &doc) {
+  bool explicitNetworkStartMode = false;
+  if (doc["networkMode"].is<const char *>()) {
+    settings.networkStartMode = parseNetworkStartMode(doc["networkMode"], settings.networkStartMode);
+    explicitNetworkStartMode = true;
+  }
+
   if (doc["hostname"].is<const char *>()) {
     copyText(settings.hostname, sizeof(settings.hostname), doc["hostname"]);
   }
@@ -427,10 +567,21 @@ static bool applySettingsJson(JsonDocument &doc) {
     if (ap["password"].is<const char *>()) {
       copyText(settings.apPassword, sizeof(settings.apPassword), ap["password"]);
     }
+    if (ap["security"].is<const char *>()) {
+      settings.apSecurityMode = parseApSecurityMode(ap["security"], settings.apSecurityMode);
+    }
     settings.apIp = parseIp(ap["ip"] | nullptr, settings.apIp);
     settings.apSubnet = parseIp(ap["subnet"] | nullptr, settings.apSubnet);
     settings.apChannel = clampU16(ap["channel"] | settings.apChannel, 1, 13);
     settings.apMaxClients = clampU16(ap["maxClients"] | settings.apMaxClients, 1, 10);
+  }
+
+  if (!explicitNetworkStartMode && strlen(settings.staSsid) > 0) {
+    settings.networkStartMode = NetworkStartMode::ClientWithApFallback;
+  }
+
+  if (settings.apSecurityMode != ApSecurityMode::Open && strlen(settings.apPassword) < 8) {
+    copyText(settings.apPassword, sizeof(settings.apPassword), DEFAULT_AP_PASSWORD);
   }
 
   JsonObject standalone = doc["standalone"].as<JsonObject>();
@@ -499,6 +650,7 @@ static bool applySettingsJson(JsonDocument &doc) {
 static String expandedApSsid();
 
 static void settingsToJson(JsonDocument &doc) {
+  doc["networkMode"] = networkStartModeName(settings.networkStartMode);
   doc["hostname"] = settings.hostname;
 
   JsonObject wifi = doc.createNestedObject("wifi");
@@ -515,6 +667,7 @@ static void settingsToJson(JsonDocument &doc) {
   JsonObject ap = doc.createNestedObject("ap");
   ap["ssid"] = settings.apSsid;
   ap["password"] = settings.apPassword;
+  ap["security"] = apSecurityModeName(settings.apSecurityMode);
   ap["ip"] = ipToString(settings.apIp);
   ap["subnet"] = ipToString(settings.apSubnet);
   ap["channel"] = settings.apChannel;
@@ -566,7 +719,7 @@ static bool loadSettingsFile(const char *path) {
     return false;
   }
 
-  DynamicJsonDocument doc(12288);
+  PsramJsonDocument doc(12288);
   DeserializationError error = deserializeJson(doc, file);
   file.close();
   if (error) {
@@ -591,7 +744,7 @@ static bool loadSettings() {
 }
 
 static bool saveSettings() {
-  DynamicJsonDocument doc(12288);
+  PsramJsonDocument doc(12288);
   settingsToJson(doc);
   File file = LittleFS.open("/settings.json", "w");
   if (!file) {
@@ -1464,6 +1617,37 @@ static void startNtp() {
   }
 }
 
+static bool startConfiguredSoftAp(const String &ssid) {
+  bool openAp = settings.apSecurityMode == ApSecurityMode::Open;
+  String password = settings.apPassword;
+  if (!openAp && password.length() < 8) {
+    password = DEFAULT_AP_PASSWORD;
+  }
+
+  bool ok = WiFi.softAP(ssid.c_str(), openAp ? nullptr : password.c_str(), settings.apChannel, 0, settings.apMaxClients);
+  if (!ok || openAp || settings.apSecurityMode == ApSecurityMode::Wpa2) {
+    return ok;
+  }
+
+  wifi_config_t conf;
+  esp_err_t err = esp_wifi_get_config(WIFI_IF_AP, &conf);
+  if (err != ESP_OK) {
+    Serial.printf("AP security read failed: %d\n", err);
+    return false;
+  }
+
+  conf.ap.authmode = apWifiAuthMode(settings.apSecurityMode);
+  conf.ap.pairwise_cipher = settings.apSecurityMode == ApSecurityMode::WpaWpa2
+                                ? WIFI_CIPHER_TYPE_TKIP_CCMP
+                                : WIFI_CIPHER_TYPE_CCMP;
+  err = esp_wifi_set_config(WIFI_IF_AP, &conf);
+  if (err != ESP_OK) {
+    Serial.printf("AP security mode %s failed: %d\n", apSecurityModeName(settings.apSecurityMode), err);
+    return false;
+  }
+  return true;
+}
+
 static void startApMode() {
   networkMode = NetworkMode::ApFallback;
   WiFi.mode(WIFI_AP_STA);
@@ -1475,13 +1659,12 @@ static void startApMode() {
   WiFi.softAPConfig(settings.apIp, settings.apIp, settings.apSubnet, leaseStart);
 
   String ssid = expandedApSsid();
-  String password = settings.apPassword;
-  const char *pass = password.length() >= 8 ? password.c_str() : nullptr;
-  bool ok = WiFi.softAP(ssid.c_str(), pass, settings.apChannel, 0, settings.apMaxClients);
+  bool ok = startConfiguredSoftAp(ssid);
   WiFi.softAPsetHostname(sanitizedHostname().c_str());
 
-  Serial.printf("AP mode %s: SSID=%s IP=%s maxClients=%u\n",
+  Serial.printf("AP mode %s: SSID=%s security=%s IP=%s maxClients=%u\n",
                 ok ? "started" : "failed", ssid.c_str(),
+                apSecurityModeName(settings.apSecurityMode),
                 WiFi.softAPIP().toString().c_str(), settings.apMaxClients);
   configureDhcpOptions();
   startDnsIfNeeded();
@@ -1572,10 +1755,11 @@ button{background:#e8eef6;cursor:pointer;font-weight:700}button.primary{backgrou
 <header><h1 title="GPS/PPS disciplined NTP server status and configuration">T-Beam NTP</h1><div class="meta" id="topline">Loading</div></header>
 <main>
 <details class="panel status-panel" open><summary title="Live clock, GPS, network, power, and memory state">Status</summary><div class="status" id="status"></div></details>
-<details class="panel network-panel"><summary title="Settings used when the T-Beam joins an existing WiFi network">Network</summary><div class="grid">
-<div class="span6"><label for="staSsid">Home SSID</label><input id="staSsid" list="scanList" maxlength="32"></div>
-<div class="span3"><label>&nbsp;</label><button class="secondary" id="scanBtn">Scan</button></div>
-<div class="span3"><label for="staPass">Home password</label><input id="staPass" type="password" maxlength="64"></div>
+<details class="panel network-panel"><summary title="Settings used when the T-Beam joins an existing WiFi network">Network Client</summary><div class="grid">
+<div class="span12"><label>Network mode</label><div class="radio-row"><label for="networkModeAp"><input name="networkMode" id="networkModeAp" type="radio" value="standaloneAp">Standalone AP Mode</label><label for="networkModeClient"><input name="networkMode" id="networkModeClient" type="radio" value="clientWithApFallback">Client Mode with AP Fallback</label></div></div>
+<div class="span6"><label for="staSsid">Network Client SSID</label><input id="staSsid" list="scanList" maxlength="32"></div>
+<div class="span3"><label>&nbsp;</label><button class="secondary" id="scanBtn" type="button">Scan</button></div>
+<div class="span3"><label for="staPass">Network Client Password</label><input id="staPass" type="password" maxlength="64"></div>
 <datalist id="scanList"></datalist>
 <div class="span4"><label for="hostname">Hostname</label><input id="hostname" maxlength="31"></div>
 <div class="span4 check"><input id="staDhcp" type="checkbox">Use DHCP</div>
@@ -1588,6 +1772,7 @@ button{background:#e8eef6;cursor:pointer;font-weight:700}button.primary{backgrou
 <details class="panel ap-panel"><summary title="Settings used when the T-Beam is its own off-grid WiFi network">Standalone AP</summary><div class="grid">
 <div class="span4"><label for="apSsid">AP SSID</label><input id="apSsid" maxlength="32" aria-describedby="apSsidNote"><div class="hint" id="apSsidNote">Use {mac} to insert this unit's last six MAC hex digits.</div></div>
 <div class="span4"><label for="apPass">AP password</label><input id="apPass" type="password" maxlength="64"></div>
+<div class="span4"><label for="apSecurity">AP security</label><select id="apSecurity"><option value="wpa2">WPA2-Personal</option><option value="wpa2-wpa3">WPA2/WPA3-Personal</option><option value="wpa3">WPA3-Personal</option><option value="wpa-wpa2">WPA/WPA2-Personal legacy</option><option value="open">Open</option></select></div>
 <div class="span2"><label for="apChannel">Channel</label><input id="apChannel" type="number" min="1" max="13"></div>
 <div class="span2"><label for="apMax">Max clients</label><input id="apMax" type="number" min="1" max="10"></div>
 <div class="span3"><label for="apIp">AP IP</label><input id="apIp"></div>
@@ -1620,7 +1805,7 @@ button{background:#e8eef6;cursor:pointer;font-weight:700}button.primary{backgrou
 <div class="span3"><label for="sysDown">PMU power-down mV</label><input id="sysDown" type="number" min="2600" max="3300" step="100"></div>
 <div class="span3"><label for="powerKey">Power key off seconds</label><select id="powerKey"><option>4</option><option>6</option><option>8</option><option>10</option></select></div>
 </div></details>
-<details class="panel actions-panel"><summary title="Save settings or restart the T-Beam">Actions</summary><div class="actions"><button class="primary" id="saveBtn">Save</button><button class="danger" id="rebootBtn">Reboot</button><span class="muted" id="message"></span></div></details>
+<section class="panel actions-panel"><h2 title="Save settings or restart the T-Beam">Actions</h2><div class="actions"><button class="primary" id="saveBtn">Save</button><button class="danger" id="rebootBtn">Reboot</button><span class="muted" id="message"></span></div></section>
 </main>
 <script>
 const $=id=>document.getElementById(id);
@@ -1629,9 +1814,11 @@ let timeZoneRows=[];
 const tips={
 topline:'Live summary of network mode, device IP, UTC/local time, and connected AP clients.',
 status:'Live operational metrics. Each metric tile also has its own tooltip.',
-staSsid:'SSID of the existing WiFi network to join in LAN mode. Leave blank to stay in standalone AP mode.',
-scanBtn:'Scan nearby WiFi networks and populate the Home SSID drop-down.',
-staPass:'Password for the selected home WiFi network. It is saved only when you press Save.',
+networkModeAp:'Start directly as the off-grid access point and skip network-client connection attempts.',
+networkModeClient:'Try the configured network-client SSID first, then fall back to standalone AP mode if connection fails or is later lost.',
+staSsid:'SSID of the existing WiFi network to join when Client Mode with AP Fallback is selected.',
+scanBtn:'Scan nearby WiFi networks and populate the Network Client SSID drop-down. The AP may pause briefly while scanning.',
+staPass:'Password for the selected network-client WiFi network. It is saved only when you press Save.',
 scanList:'Nearby WiFi networks discovered by the last scan.',
 hostname:'Hostname used on the LAN and for mDNS services. Keep it short, unique, and DNS-safe.',
 staDhcp:'Use the router DHCP lease in LAN mode. Turn this off only when you want a fixed IPv4 address.',
@@ -1642,7 +1829,8 @@ subnet:'Subnet mask for static LAN mode, normally 255.255.255.0 on small network
 dns1:'DNS server used by the T-Beam in LAN mode when static addressing is selected.',
 apSsid:'Standalone AP network name. The literal token {mac} is replaced with the last six MAC hex digits for this unit before the AP starts.',
 apSsidNote:'Shows the AP SSID after {mac} expansion, using the value reported by the firmware.',
-apPass:'Standalone AP password. Default is tbeam-ntp. Leave blank for an open field network, or use at least 8 characters for WPA.',
+apPass:'Standalone AP password. Default is tbeam-ntp. Secure AP modes require at least 8 characters.',
+apSecurity:'Standalone AP security mode. WEP is not offered because ESP32 SoftAP mode does not support WEP.',
 apChannel:'2.4 GHz WiFi channel for standalone AP mode. Use 1, 6, or 11 when avoiding overlap.',
 apMax:'Maximum SoftAP stations allowed. Higher values increase management and buffer pressure.',
 apIp:'IPv4 address of the T-Beam in standalone AP mode. DHCP, DNS, portal, and NTP use this address.',
@@ -1709,22 +1897,25 @@ async function getJson(url,opts){const r=await fetch(url,opts);if(!r.ok)throw ne
 function setMsg(t,c=''){const el=$('message');el.textContent=t;el.className='muted '+c}
 function setOffsetControls(minutes){const m=Number(minutes)||0;$('offsetSign').value=m<0?'-1':'1';const a=Math.abs(m);$('offsetHours').value=Math.floor(a/60);$('offsetMinutes').value=a%60;$('manualOffset').value=m}
 function offsetFromControls(){const sign=+$('offsetSign').value||1;const h=Math.min(14,Math.max(0,+$('offsetHours').value||0));const m=Math.min(59,Math.max(0,+$('offsetMinutes').value||0));return sign*(h*60+m)}
+function getNetworkMode(){const el=document.querySelector('input[name="networkMode"]:checked');return el?el.value:'standaloneAp'}
+function setNetworkMode(mode){const id=mode==='clientWithApFallback'?'networkModeClient':'networkModeAp';($(id)||$('networkModeAp')).checked=true}
 function getTimeMode(){const el=document.querySelector('input[name="timeMode"]:checked');return el?el.value:'iana'}
 function updateTimeModeVisibility(){const mode=getTimeMode();document.querySelectorAll('.time-mode-body').forEach(el=>el.classList.toggle('hidden',el.dataset.timeMode!==mode))}
 function wireTimeModeControls(){document.querySelectorAll('input[name="timeMode"]').forEach(el=>{el.onchange=updateTimeModeVisibility})}
 function setTimeMode(mode){const id='timeMode'+String(mode||'iana').replace(/^./,c=>c.toUpperCase());const el=$(id)||$('timeModeIana');el.checked=true;updateTimeModeVisibility()}
 function populateTimeZones(selected){const sel=$('ianaTimeZone');sel.innerHTML='';if(!timeZoneRows.length){const o=document.createElement('option');o.value=selected||'';o.textContent='Timezone file missing';sel.appendChild(o);sel.disabled=true;return}sel.disabled=false;timeZoneRows.forEach(z=>{const o=document.createElement('option');o.value=z.name;o.textContent=z.name;sel.appendChild(o)});sel.value=selected||'America/Los_Angeles';if(sel.value!==selected&&selected){const o=document.createElement('option');o.value=selected;o.textContent=selected+' (not in file)';sel.insertBefore(o,sel.firstChild);sel.value=selected}}
 async function loadTimeZones(){try{const r=await fetch('/api/timezones');if(!r.ok)throw new Error('missing');const text=await r.text();timeZoneRows=text.split(/\r?\n/).map(x=>x.trim()).filter(x=>x&&!x.startsWith('#')).map(x=>{const p=x.split('\t');return{name:p[0],posix:p.slice(1).join('\t')}}).filter(x=>x.name&&x.posix)}catch(e){timeZoneRows=[]}}
+function updateApSecurityUi(){const open=$('apSecurity').value==='open';$('apPass').disabled=open;$('apPass').placeholder=open?'not used in open mode':''}
 function updateBatteryMeter(p){const fill=$('batteryFill'),pct=$('batteryPct'),state=$('batteryState'),details=$('batteryDetails');if(!fill||!pct||!state||!details)return;if(!p||!p.online){fill.style.width='0%';fill.className='battery-fill bad';pct.textContent='--';state.textContent='PMU offline';details.textContent='No AXP192 telemetry';return}if(!p.batteryPresent){fill.style.width='0%';fill.className='battery-fill';pct.textContent='USB';state.textContent=p.vbusPresent?'\u26A1 USB power':'No battery';details.textContent=p.vbusPresent?`${Number(p.vbusMv||0).toFixed(0)} mV ${Number(p.vbusCurrentMa||0).toFixed(0)} mA VBUS`:'Battery not detected';return}const raw=Number(p.batteryPercent);const percent=Number.isFinite(raw)&&raw>=0?Math.min(100,Math.max(0,Math.round(raw))):0;fill.style.width=percent+'%';fill.className='battery-fill '+(p.warning||percent<=10?'bad':percent<=25?'warn':'');pct.textContent=Number.isFinite(raw)&&raw>=0?percent+'%':'--';state.textContent=p.charging?'\u26A1 Charging':(p.discharging?'\u25BE Discharging':'Idle');details.textContent=`${Number(p.batteryMv||0).toFixed(0)} mV ${Number(p.batteryCurrentMa||0).toFixed(0)} mA`}
 function fillSettings(s){
 current=s;const d=s.display||{},t=s.time||{};
-$('hostname').value=s.hostname||'';$('staSsid').value=s.wifi.ssid||'';$('staPass').value=s.wifi.password||'';$('staDhcp').checked=!!s.wifi.dhcp;$('staticIp').value=s.wifi.staticIp;$('gateway').value=s.wifi.gateway;$('subnet').value=s.wifi.subnet;$('dns1').value=s.wifi.dns1;$('connectTimeout').value=s.wifi.connectTimeoutSec;$('apSsid').value=s.ap.ssid;$('apPass').value=s.ap.password;$('apIp').value=s.ap.ip;$('apSubnet').value=s.ap.subnet;$('apChannel').value=s.ap.channel;$('apMax').value=s.ap.maxClients;$('opt42').checked=!!s.standalone.dhcpOption42;$('dnsAliases').checked=!!s.standalone.dnsNtpAliases;$('dnsWildcard').checked=!!s.standalone.dnsWildcardCaptive;$('ntpHosts').value=(s.standalone.ntpHosts||[]).join('\n');setTimeMode(t.mode||((t.observeDst===false)?'offset':'posix'));setOffsetControls(t.manualOffsetMinutes??0);populateTimeZones(t.ianaTimeZone||'America/Los_Angeles');$('posixTimezone').value=t.posixTimezone||'PST8PDT,M3.2.0/2,M11.1.0/2';$('observeDst').value='';$('autoOffset').value='';$('chargeEnabled').checked=!!s.power.chargeEnabled;$('chargeCurrent').value=s.power.chargeCurrentMa;$('chargeVoltage').value=s.power.chargeTargetMv;$('vbusLimit').value=s.power.vbusCurrentLimitMa;$('warnVoltage').value=s.power.warningVoltageMv;$('cutoffVoltage').value=s.power.cutoffVoltageMv;$('sysDown').value=s.power.sysPowerDownMv;$('powerKey').value=s.power.powerKeyOffSeconds;$('oledCycle').checked=d.autoCycle!==false;$('oledCycleSeconds').value=d.cycleSeconds||5;$('screenTimeout').value=d.screensaverTimeoutSec??300;const ex=s.ap.expandedSsid||s.ap.ssid||'';$('apSsidNote').textContent=`Use {mac} to insert this unit's last six MAC hex digits. Current AP SSID: ${ex}.`}
-function readSettings(){const mode=getTimeMode(),offset=offsetFromControls();return{hostname:$('hostname').value,wifi:{ssid:$('staSsid').value,password:$('staPass').value,dhcp:$('staDhcp').checked,staticIp:$('staticIp').value,gateway:$('gateway').value,subnet:$('subnet').value,dns1:$('dns1').value,dns2:(current.wifi&&current.wifi.dns2)||'1.1.1.1',connectTimeoutSec:+$('connectTimeout').value},ap:{ssid:$('apSsid').value,password:$('apPass').value,ip:$('apIp').value,subnet:$('apSubnet').value,channel:+$('apChannel').value,maxClients:+$('apMax').value},standalone:{dhcpOption42:$('opt42').checked,dnsNtpAliases:$('dnsAliases').checked,dnsWildcardCaptive:$('dnsWildcard').checked,ntpHosts:$('ntpHosts').value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean)},time:{mode,ianaTimeZone:$('ianaTimeZone').value,posixTimezone:$('posixTimezone').value.trim(),autoLocalOffset:false,observeDst:mode!=='offset',manualOffsetMinutes:offset},display:{autoCycle:$('oledCycle').checked,cycleSeconds:+$('oledCycleSeconds').value,screensaverTimeoutSec:+$('screenTimeout').value},power:{chargeEnabled:$('chargeEnabled').checked,chargeCurrentMa:+$('chargeCurrent').value,chargeTargetMv:+$('chargeVoltage').value,vbusCurrentLimitMa:+$('vbusLimit').value,warningVoltageMv:+$('warnVoltage').value,cutoffVoltageMv:+$('cutoffVoltage').value,sysPowerDownMv:+$('sysDown').value,powerKeyOffSeconds:+$('powerKey').value}}}
+$('hostname').value=s.hostname||'';setNetworkMode(s.networkMode||((s.wifi.ssid||'')?'clientWithApFallback':'standaloneAp'));$('staSsid').value=s.wifi.ssid||'';$('staPass').value=s.wifi.password||'';$('staDhcp').checked=!!s.wifi.dhcp;$('staticIp').value=s.wifi.staticIp;$('gateway').value=s.wifi.gateway;$('subnet').value=s.wifi.subnet;$('dns1').value=s.wifi.dns1;$('connectTimeout').value=s.wifi.connectTimeoutSec;$('apSsid').value=s.ap.ssid;$('apPass').value=s.ap.password;$('apSecurity').value=s.ap.security||'wpa2';updateApSecurityUi();$('apIp').value=s.ap.ip;$('apSubnet').value=s.ap.subnet;$('apChannel').value=s.ap.channel;$('apMax').value=s.ap.maxClients;$('opt42').checked=!!s.standalone.dhcpOption42;$('dnsAliases').checked=!!s.standalone.dnsNtpAliases;$('dnsWildcard').checked=!!s.standalone.dnsWildcardCaptive;$('ntpHosts').value=(s.standalone.ntpHosts||[]).join('\n');setTimeMode(t.mode||((t.observeDst===false)?'offset':'posix'));setOffsetControls(t.manualOffsetMinutes??0);populateTimeZones(t.ianaTimeZone||'America/Los_Angeles');$('posixTimezone').value=t.posixTimezone||'PST8PDT,M3.2.0/2,M11.1.0/2';$('observeDst').value='';$('autoOffset').value='';$('chargeEnabled').checked=!!s.power.chargeEnabled;$('chargeCurrent').value=s.power.chargeCurrentMa;$('chargeVoltage').value=s.power.chargeTargetMv;$('vbusLimit').value=s.power.vbusCurrentLimitMa;$('warnVoltage').value=s.power.warningVoltageMv;$('cutoffVoltage').value=s.power.cutoffVoltageMv;$('sysDown').value=s.power.sysPowerDownMv;$('powerKey').value=s.power.powerKeyOffSeconds;$('oledCycle').checked=d.autoCycle!==false;$('oledCycleSeconds').value=d.cycleSeconds||5;$('screenTimeout').value=d.screensaverTimeoutSec??300;const ex=s.ap.expandedSsid||s.ap.ssid||'';$('apSsidNote').textContent=`Use {mac} to insert this unit's last six MAC hex digits. Current AP SSID: ${ex}.`}
+function readSettings(){const mode=getTimeMode(),offset=offsetFromControls();return{networkMode:getNetworkMode(),hostname:$('hostname').value,wifi:{ssid:$('staSsid').value,password:$('staPass').value,dhcp:$('staDhcp').checked,staticIp:$('staticIp').value,gateway:$('gateway').value,subnet:$('subnet').value,dns1:$('dns1').value,dns2:(current.wifi&&current.wifi.dns2)||'1.1.1.1',connectTimeoutSec:+$('connectTimeout').value},ap:{ssid:$('apSsid').value,password:$('apPass').value,security:$('apSecurity').value,ip:$('apIp').value,subnet:$('apSubnet').value,channel:+$('apChannel').value,maxClients:+$('apMax').value},standalone:{dhcpOption42:$('opt42').checked,dnsNtpAliases:$('dnsAliases').checked,dnsWildcardCaptive:$('dnsWildcard').checked,ntpHosts:$('ntpHosts').value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean)},time:{mode,ianaTimeZone:$('ianaTimeZone').value,posixTimezone:$('posixTimezone').value.trim(),autoLocalOffset:false,observeDst:mode!=='offset',manualOffsetMinutes:offset},display:{autoCycle:$('oledCycle').checked,cycleSeconds:+$('oledCycleSeconds').value,screensaverTimeoutSec:+$('screenTimeout').value},power:{chargeEnabled:$('chargeEnabled').checked,chargeCurrentMa:+$('chargeCurrent').value,chargeTargetMv:+$('chargeVoltage').value,vbusCurrentLimitMa:+$('vbusLimit').value,warningVoltageMv:+$('warnVoltage').value,cutoffVoltageMv:+$('cutoffVoltage').value,sysPowerDownMv:+$('sysDown').value,powerKeyOffSeconds:+$('powerKey').value}}}
 async function refreshStatus(){try{const s=await getJson('/api/status');updateBatteryMeter(s.power);$('topline').textContent=`${s.mode} ${s.ip} | UTC ${s.utc||'not synced'} | Local ${s.local||'not synced'} | clients ${s.clients}`;let gps=s.gps.fix?'ok':(s.gps.seen?'warn':'bad');let pwr=s.power.online?(s.power.warning?'warn':'ok'):'warn';let tz=s.timeZone?`${s.timeZone} ${s.dstActive?'DST':'STD'}`:offsetLabel(s.localOffsetMinutes);$('status').innerHTML=metric('Mode',s.mode)+metric('Version',s.version||'')+metric('IP',s.ip)+metric('UTC',s.utc||'not synced',s.clock.synced?'ok':'bad')+metric('Local',s.local||'not synced',s.clock.synced?'ok':'bad')+metric('TZ',tz)+metric('PPS',s.clock.pps?'locked':'waiting',s.clock.pps?'ok':'warn')+metric('GPS',`${s.gps.sats} sats ${s.gps.grid||''}`,gps)+metric('Location',s.gps.fix?`${s.gps.lat.toFixed(6)}, ${s.gps.lon.toFixed(6)}`:'no fix')+metric('Altitude',s.gps.fix?`${s.gps.alt.toFixed(1)} m`:'')+metric('DOP',s.gps.dop||'')+metric('Battery',s.power.online?(s.power.batteryPresent?`${s.power.batteryMv} mV ${s.power.batteryCurrentMa.toFixed(0)} mA`:'no battery'):'PMU offline',pwr)+metric('VBUS',s.power.online?`${s.power.vbusMv} mV ${s.power.vbusCurrentMa.toFixed(0)} mA`:'')+metric('NTP/DNS',`${s.ntpRequests}/${s.ntpSuppressed} / ${s.dnsQueries}`)+metric('Heap',`${s.heap.free} free, PSRAM ${s.heap.psramFree}`)}catch(e){setMsg(e.message,'bad')}}
-async function load(){applyTooltips();wireTimeModeControls();await loadTimeZones();fillSettings(await getJson('/api/settings'));refreshStatus();setInterval(refreshStatus,2000)}
+async function load(){applyTooltips();wireTimeModeControls();$('apSecurity').onchange=updateApSecurityUi;await loadTimeZones();fillSettings(await getJson('/api/settings'));refreshStatus();setInterval(refreshStatus,2000)}
 $('saveBtn').onclick=async()=>{try{setMsg('Saving');await getJson('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(readSettings())});setMsg('Saved. Reboot to apply network changes.','ok')}catch(e){setMsg(e.message,'bad')}};
 $('rebootBtn').onclick=async()=>{if(confirm('Reboot now?')){await fetch('/api/reboot',{method:'POST'});setMsg('Rebooting')}};
-$('scanBtn').onclick=async()=>{try{setMsg('Scanning');const s=await getJson('/api/scan');const list=$('scanList');list.innerHTML='';s.networks.forEach(n=>{const o=document.createElement('option');o.value=n.ssid;o.label=`${n.rssi} dBm ch ${n.channel}`;list.appendChild(o)});setMsg(`Found ${s.networks.length} networks`)}catch(e){setMsg(e.message,'bad')}};
+$('scanBtn').onclick=async()=>{const btn=$('scanBtn');try{btn.disabled=true;btn.textContent='Scanning';setMsg('Scanning');const s=await getJson('/api/scan');if(s.error)throw new Error(s.error);const list=$('scanList');list.innerHTML='';(s.networks||[]).forEach(n=>{const o=document.createElement('option');o.value=n.ssid;o.label=`${n.rssi} dBm ch ${n.channel} ${n.auth||''}`;list.appendChild(o)});setMsg(`Found ${(s.networks||[]).length} networks${s.count>(s.networks||[]).length?' (showing strongest 40)':''}`)}catch(e){setMsg(e.message,'bad')}finally{btn.disabled=false;btn.textContent='Scan'}};
 load();
 </script>
 </body>
@@ -1742,7 +1933,7 @@ static void handleRoot() {
 }
 
 static void handleSettingsGet() {
-  DynamicJsonDocument doc(12288);
+  PsramJsonDocument doc(12288);
   settingsToJson(doc);
   sendJson(doc);
 }
@@ -1763,7 +1954,7 @@ static void handleSettingsSave() {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing body\"}");
     return;
   }
-  DynamicJsonDocument doc(12288);
+  PsramJsonDocument doc(12288);
   DeserializationError error = deserializeJson(doc, server.arg("plain"));
   if (error) {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid json\"}");
@@ -1779,16 +1970,24 @@ static void handleSettingsSave() {
 }
 
 static void handleScan() {
-  int count = WiFi.scanNetworks(false, true);
-  DynamicJsonDocument doc(4096);
+  PsramJsonDocument doc(12288);
   JsonArray networks = doc.createNestedArray("networks");
+  int count = WiFi.scanNetworks(false, true, false, 180);
+  if (count < 0) {
+    doc["error"] = "scan failed";
+    sendJson(doc);
+    return;
+  }
   for (int i = 0; i < count && i < 40; ++i) {
+    wifi_auth_mode_t authMode = WiFi.encryptionType(i);
     JsonObject n = networks.createNestedObject();
     n["ssid"] = WiFi.SSID(i);
     n["rssi"] = WiFi.RSSI(i);
     n["channel"] = WiFi.channel(i);
-    n["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+    n["secure"] = authMode != WIFI_AUTH_OPEN;
+    n["auth"] = wifiAuthModeLabel(authMode);
   }
+  doc["count"] = count;
   WiFi.scanDelete();
   sendJson(doc);
 }
@@ -1806,12 +2005,14 @@ static void handleStatus() {
   int16_t localOffset = servingTime ? currentLocalOffsetMinutes(nowUsec) : currentLocalOffsetMinutes();
   bool gpsFix = hasFreshGpsFix();
 
-  DynamicJsonDocument doc(8192);
+  PsramJsonDocument doc(12288);
   doc["mode"] = networkMode == NetworkMode::Sta ? "STA" : "AP";
+  doc["networkMode"] = networkStartModeName(settings.networkStartMode);
   doc["version"] = FIRMWARE_VERSION;
   doc["ip"] = networkMode == NetworkMode::Sta ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
   doc["hostname"] = sanitizedHostname();
   doc["clients"] = networkMode == NetworkMode::ApFallback ? WiFi.softAPgetStationNum() : 0;
+  doc["apSecurity"] = apSecurityModeName(settings.apSecurityMode);
   doc["utc"] = servingTime ? formatUtc(nowUsec) : "";
   doc["local"] = servingTime ? formatLocal(nowUsec) : "";
   doc["localOffsetMinutes"] = localOffset;
@@ -1929,7 +2130,7 @@ static void drawTimePage(const String &title, const String &timestamp, bool serv
 }
 
 static String apPasswordForDisplay() {
-  if (strlen(settings.apPassword) == 0) {
+  if (settings.apSecurityMode == ApSecurityMode::Open || strlen(settings.apPassword) == 0) {
     return "(open)";
   }
   return String(settings.apPassword);
@@ -2285,7 +2486,9 @@ void setup() {
   GPSSerial.begin(GPS_BAUD, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
 
   scanI2c();
-  if (bootForceApMode || !startStaMode()) {
+  if (bootForceApMode ||
+      settings.networkStartMode == NetworkStartMode::StandaloneAp ||
+      !startStaMode()) {
     startApMode();
   }
   startNtp();

@@ -1,4 +1,5 @@
 {
+  "networkMode": "standaloneAp",
   "hostname": "tbeam-ntp",
   "wifi": {
     "ssid": "",
@@ -14,6 +15,7 @@
   "ap": {
     "ssid": "TBeam-NTP-{mac}",
     "password": "tbeam-ntp",
+    "security": "wpa2",
     "ip": "192.168.4.1",
     "subnet": "255.255.255.0",
     "channel": 6,
