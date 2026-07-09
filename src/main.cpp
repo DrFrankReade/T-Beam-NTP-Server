@@ -45,13 +45,21 @@ static constexpr uint8_t OLED_PAGE_COUNT = 7;
 static constexpr uint32_t USER_BUTTON_FACTORY_RESET_MS = 10000;
 static constexpr uint32_t FACTORY_RESET_CONFIRM_WINDOW_MS = 30000;
 static constexpr uint32_t OLED_MANUAL_CYCLE_PAUSE_MS = 30000;
-static constexpr const char *FIRMWARE_VERSION = "v0.1.2";
+static constexpr const char *FIRMWARE_VERSION = "v0.1.3";
 static constexpr const char *DEFAULT_POSIX_TZ = "PST8PDT,M3.2.0/2,M11.1.0/2";
+static constexpr const char *DEFAULT_IANA_TIME_ZONE = "America/Los_Angeles";
 static constexpr const char *DEFAULT_AP_PASSWORD = "tbeam-ntp";
+static constexpr const char *TIMEZONE_DB_PATH = "/timezones.current.tsv";
 
 enum class NetworkMode {
   ApFallback,
   Sta
+};
+
+enum class LocalTimeMode : uint8_t {
+  Offset,
+  Iana,
+  Posix
 };
 
 struct DeviceSettings {
@@ -83,6 +91,8 @@ struct DeviceSettings {
   bool autoLocalOffset;
   int16_t manualOffsetMinutes;
   bool observeDst;
+  LocalTimeMode localTimeMode;
+  char ianaTimeZone[64];
   char posixTimezone[POSIX_TZ_MAX_LEN];
 
   bool oledAutoCycle;
@@ -150,6 +160,10 @@ static uint32_t lastOledActivityMs = 0;
 static uint32_t oledAutoCyclePausedUntilMs = 0;
 static uint32_t lastI2cScanMs = 0;
 static String activePosixTimezone;
+static String cachedIanaZone;
+static String cachedIanaPosixTimezone;
+static bool cachedIanaLookupDone = false;
+static bool cachedIanaFound = false;
 static bool posixTimezoneApplied = false;
 static String i2cDevices = "";
 static uint8_t oledPage = 0;
@@ -157,9 +171,6 @@ static bool oledSleeping = false;
 static bool lastDisplayGpsFix = false;
 static uint32_t splashUntilMs = 0;
 static bool bootForceApMode = false;
-static bool factoryResetConfirmPending = false;
-static bool factoryResetConfirmHoldArmed = false;
-static uint32_t factoryResetConfirmUntilMs = 0;
 
 static portMUX_TYPE ppsMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool ppsPending = false;
@@ -205,6 +216,64 @@ static void copyPosixTimezone(char *dst, size_t len, const char *src) {
     }
   }
   dst[out] = '\0';
+}
+
+static void copyIanaTimeZone(char *dst, size_t len, const char *src) {
+  if (len == 0) {
+    return;
+  }
+  if (!src) {
+    src = "";
+  }
+
+  size_t out = 0;
+  for (size_t i = 0; src[i] != '\0' && out + 1 < len; ++i) {
+    char c = src[i];
+    bool allowed = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                   (c >= '0' && c <= '9') || c == '/' || c == '_' ||
+                   c == '-' || c == '+';
+    if (allowed) {
+      dst[out++] = c;
+    }
+  }
+  dst[out] = '\0';
+}
+
+static const char *localTimeModeName(LocalTimeMode mode) {
+  switch (mode) {
+    case LocalTimeMode::Offset:
+      return "offset";
+    case LocalTimeMode::Iana:
+      return "iana";
+    case LocalTimeMode::Posix:
+      return "posix";
+  }
+  return "iana";
+}
+
+static LocalTimeMode parseLocalTimeMode(const char *text, LocalTimeMode fallback) {
+  if (!text) {
+    return fallback;
+  }
+  if (strcmp(text, "offset") == 0) {
+    return LocalTimeMode::Offset;
+  }
+  if (strcmp(text, "iana") == 0) {
+    return LocalTimeMode::Iana;
+  }
+  if (strcmp(text, "posix") == 0) {
+    return LocalTimeMode::Posix;
+  }
+  return fallback;
+}
+
+static void invalidateTimeZoneCache() {
+  cachedIanaZone = "";
+  cachedIanaPosixTimezone = "";
+  cachedIanaLookupDone = false;
+  cachedIanaFound = false;
+  activePosixTimezone = "";
+  posixTimezoneApplied = false;
 }
 
 static uint16_t clampU16(uint16_t value, uint16_t low, uint16_t high) {
@@ -307,9 +376,11 @@ static void setHardDefaults() {
   settings.dnsWildcardCaptive = true;
   addDefaultNtpHosts();
 
-  settings.autoLocalOffset = true;
+  settings.autoLocalOffset = false;
   settings.manualOffsetMinutes = 0;
   settings.observeDst = true;
+  settings.localTimeMode = LocalTimeMode::Iana;
+  copyIanaTimeZone(settings.ianaTimeZone, sizeof(settings.ianaTimeZone), DEFAULT_IANA_TIME_ZONE);
   copyPosixTimezone(settings.posixTimezone, sizeof(settings.posixTimezone), DEFAULT_POSIX_TZ);
 
   settings.oledAutoCycle = true;
@@ -382,9 +453,18 @@ static bool applySettingsJson(JsonDocument &doc) {
     settings.autoLocalOffset = time["autoLocalOffset"] | settings.autoLocalOffset;
     settings.manualOffsetMinutes = clampI16(time["manualOffsetMinutes"] | settings.manualOffsetMinutes, -14 * 60, 14 * 60);
     settings.observeDst = time["observeDst"] | settings.observeDst;
+    if (time["mode"].is<const char *>()) {
+      settings.localTimeMode = parseLocalTimeMode(time["mode"], settings.localTimeMode);
+    } else if (time["observeDst"].is<bool>()) {
+      settings.localTimeMode = settings.observeDst ? LocalTimeMode::Posix : LocalTimeMode::Offset;
+    }
+    if (time["ianaTimeZone"].is<const char *>()) {
+      copyIanaTimeZone(settings.ianaTimeZone, sizeof(settings.ianaTimeZone), time["ianaTimeZone"]);
+    }
     if (time["posixTimezone"].is<const char *>()) {
       copyPosixTimezone(settings.posixTimezone, sizeof(settings.posixTimezone), time["posixTimezone"]);
     }
+    invalidateTimeZoneCache();
   }
 
   JsonObject displaySettings = doc["display"].as<JsonObject>();
@@ -451,10 +531,13 @@ static void settingsToJson(JsonDocument &doc) {
   }
 
   JsonObject time = doc.createNestedObject("time");
+  time["mode"] = localTimeModeName(settings.localTimeMode);
   time["autoLocalOffset"] = settings.autoLocalOffset;
   time["manualOffsetMinutes"] = settings.manualOffsetMinutes;
   time["observeDst"] = settings.observeDst;
+  time["ianaTimeZone"] = settings.ianaTimeZone;
   time["posixTimezone"] = settings.posixTimezone;
+  time["databasePath"] = TIMEZONE_DB_PATH;
 
   JsonObject displaySettings = doc.createNestedObject("display");
   displaySettings["autoCycle"] = settings.oledAutoCycle;
@@ -666,19 +749,86 @@ static String formatUtc(uint64_t unixUsec, int16_t offsetMinutes = 0) {
   return formatTm(out);
 }
 
-static bool applyPosixTimezone() {
-  if (!settings.observeDst || settings.posixTimezone[0] == '\0') {
+static bool lookupTimeZonePreset(const char *zoneName, String &posixRule) {
+  if (!zoneName || zoneName[0] == '\0') {
     return false;
   }
 
-  String rule(settings.posixTimezone);
+  File file = LittleFS.open(TIMEZONE_DB_PATH, "r");
+  if (!file) {
+    return false;
+  }
+
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0 || line[0] == '#') {
+      continue;
+    }
+    int tab = line.indexOf('\t');
+    if (tab <= 0) {
+      continue;
+    }
+    String name = line.substring(0, tab);
+    if (name == zoneName) {
+      posixRule = line.substring(tab + 1);
+      posixRule.trim();
+      return posixRule.length() > 0;
+    }
+  }
+
+  return false;
+}
+
+static bool selectedIanaTimeZoneRule(String &posixRule) {
+  String selected(settings.ianaTimeZone);
+  if (!cachedIanaLookupDone || cachedIanaZone != selected) {
+    cachedIanaZone = selected;
+    cachedIanaPosixTimezone = "";
+    cachedIanaFound = lookupTimeZonePreset(settings.ianaTimeZone, cachedIanaPosixTimezone);
+    cachedIanaLookupDone = true;
+  }
+  if (!cachedIanaFound) {
+    return false;
+  }
+  posixRule = cachedIanaPosixTimezone;
+  return true;
+}
+
+static bool configuredPosixRule(String &rule) {
+  if (settings.localTimeMode == LocalTimeMode::Offset) {
+    return false;
+  }
+
+  if (settings.localTimeMode == LocalTimeMode::Iana && selectedIanaTimeZoneRule(rule)) {
+    return true;
+  }
+
+  if (settings.posixTimezone[0] != '\0') {
+    rule = settings.posixTimezone;
+    return true;
+  }
+
+  return false;
+}
+
+static bool applyPosixTimezoneRule(const String &rule) {
+  if (rule.length() == 0) {
+    return false;
+  }
+
   if (!posixTimezoneApplied || activePosixTimezone != rule) {
-    setenv("TZ", settings.posixTimezone, 1);
+    setenv("TZ", rule.c_str(), 1);
     tzset();
     activePosixTimezone = rule;
     posixTimezoneApplied = true;
   }
   return true;
+}
+
+static bool applyConfiguredLocalTimezone() {
+  String rule;
+  return configuredPosixRule(rule) && applyPosixTimezoneRule(rule);
 }
 
 static int16_t offsetFromLocalTm(time_t utcSeconds, const tm &localTm) {
@@ -689,23 +839,18 @@ static int16_t offsetFromLocalTm(time_t utcSeconds, const tm &localTm) {
 }
 
 static int16_t currentLocalOffsetMinutes(uint64_t unixUsec = 0) {
-  if (unixUsec != 0 && applyPosixTimezone()) {
+  if (unixUsec != 0 && applyConfiguredLocalTimezone()) {
     time_t seconds = static_cast<time_t>(unixUsec / 1000000ULL);
     tm localTm;
     localtime_r(&seconds, &localTm);
     return offsetFromLocalTm(seconds, localTm);
   }
 
-  if (settings.autoLocalOffset && gps.location.isValid() && gps.location.age() < 30000) {
-    int offsetHours = static_cast<int>(round(gps.location.lng() / 15.0));
-    offsetHours = clampI16(offsetHours, -12, 14);
-    return offsetHours * 60;
-  }
   return settings.manualOffsetMinutes;
 }
 
 static bool isLocalDstActive(uint64_t unixUsec) {
-  if (!applyPosixTimezone()) {
+  if (!applyConfiguredLocalTimezone()) {
     return false;
   }
   time_t seconds = static_cast<time_t>(unixUsec / 1000000ULL);
@@ -715,7 +860,7 @@ static bool isLocalDstActive(uint64_t unixUsec) {
 }
 
 static String localTimezoneName(uint64_t unixUsec) {
-  if (!applyPosixTimezone()) {
+  if (!applyConfiguredLocalTimezone()) {
     return "";
   }
   time_t seconds = static_cast<time_t>(unixUsec / 1000000ULL);
@@ -727,7 +872,7 @@ static String localTimezoneName(uint64_t unixUsec) {
 }
 
 static String formatLocal(uint64_t unixUsec) {
-  if (applyPosixTimezone()) {
+  if (applyConfiguredLocalTimezone()) {
     time_t seconds = static_cast<time_t>(unixUsec / 1000000ULL);
     tm localTm;
     localtime_r(&seconds, &localTm);
@@ -1415,6 +1560,7 @@ details.panel>summary{cursor:pointer;font-weight:800;font-size:15px;margin:-2px 
 h2{font-size:15px;margin:0 0 12px}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:10px 12px}.span3{grid-column:span 3}.span4{grid-column:span 4}.span6{grid-column:span 6}.span8{grid-column:span 8}.span12{grid-column:span 12}
 label{display:block;font-weight:650;margin-bottom:4px}input,select,textarea,button{width:100%;font:inherit;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);padding:9px 10px}textarea{min-height:160px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
 input[type=checkbox]{width:auto;margin-right:8px}.check{display:flex;align-items:center;min-height:39px;color:var(--ink);font-weight:650}.actions{display:flex;gap:10px;flex-wrap:wrap}.actions button{width:auto;min-width:120px}
+.radio-row{display:flex;gap:14px;flex-wrap:wrap;align-items:center;min-height:39px}.radio-row label{display:flex;gap:6px;align-items:center;margin:0;font-weight:650}.radio-row input{width:auto;margin:0}
 button{background:#e8eef6;cursor:pointer;font-weight:700}button.primary{background:var(--accent);border-color:var(--accent);color:#fff}button.secondary{background:#eaf0ff;border-color:#c6d4ff;color:#173b87}button.danger{background:#fff0f0;border-color:#ffc7c7;color:var(--bad)}
 .status{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.metric{border:1px solid var(--line);border-radius:8px;padding:10px;background:#fbfcfd}.metric b{display:block;font-size:12px;color:var(--muted);margin-bottom:3px}.metric span{font-size:15px}
 .ok{color:var(--accent)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted,.hint{color:var(--muted);font-size:12px}.hint{margin-top:5px;line-height:1.3}.hidden{display:none}
@@ -1451,10 +1597,13 @@ button{background:#e8eef6;cursor:pointer;font-weight:700}button.primary{backgrou
 <div class="span12"><label for="ntpHosts">NTP host aliases</label><textarea id="ntpHosts" spellcheck="false"></textarea></div>
 </div></details>
 <details class="panel time-panel"><summary title="Local display time, OLED behavior, and AXP192 battery/USB power settings">Time, Display, And Power</summary><div class="grid">
-<div class="span3 check"><input id="observeDst" type="checkbox">Use POSIX TZ/DST</div>
+<div class="span12"><label>Local time mode</label><div class="radio-row"><label for="timeModeOffset"><input name="timeMode" id="timeModeOffset" type="radio" value="offset">UTC offset</label><label for="timeModeIana"><input name="timeMode" id="timeModeIana" type="radio" value="iana">Time zone</label><label for="timeModePosix"><input name="timeMode" id="timeModePosix" type="radio" value="posix">POSIX rule</label></div></div>
+<div class="span2"><label for="offsetSign">Offset sign</label><select id="offsetSign"><option value="1">UTC+</option><option value="-1">UTC-</option></select></div>
+<div class="span2"><label for="offsetHours">Offset hours</label><input id="offsetHours" type="number" min="0" max="14"></div>
+<div class="span2"><label for="offsetMinutes">Offset minutes</label><input id="offsetMinutes" type="number" min="0" max="59"></div>
+<div class="span6"><label for="ianaTimeZone">Time zone</label><select id="ianaTimeZone"><option value="">Loading timezone file</option></select><div class="hint" id="tzDbNote">Timezone presets come from LittleFS /timezones.current.tsv.</div></div>
 <div class="span6"><label for="posixTimezone">POSIX TZ rule</label><input id="posixTimezone" maxlength="95"></div>
-<div class="span3 check"><input id="autoOffset" type="checkbox">Auto fallback offset</div>
-<div class="span3"><label for="manualOffset">Manual offset minutes</label><input id="manualOffset" type="number" min="-840" max="840"></div>
+<input id="manualOffset" type="hidden"><input id="observeDst" type="hidden"><input id="autoOffset" type="hidden">
 <div class="span3 check"><input id="chargeEnabled" type="checkbox">Charging enabled</div>
 <div class="span3"><label for="chargeCurrent">Charge current mA</label><select id="chargeCurrent"><option>100</option><option>190</option><option selected>280</option><option>360</option><option>450</option><option>550</option><option>630</option><option>700</option></select></div>
 <div class="span3"><label for="chargeVoltage">Charge target mV</label><select id="chargeVoltage"><option>4100</option><option>4150</option><option>4200</option></select></div>
@@ -1472,6 +1621,8 @@ button{background:#e8eef6;cursor:pointer;font-weight:700}button.primary{backgrou
 <script>
 const $=id=>document.getElementById(id);
 let current={};
+let timeZoneRows=[];
+let timeZoneDbNote='Timezone presets come from LittleFS /timezones.current.tsv.';
 const tips={
 topline:'Live summary of network mode, device IP, UTC/local time, and connected AP clients.',
 status:'Live operational metrics. Each metric tile also has its own tooltip.',
@@ -1497,10 +1648,18 @@ opt42:'Advertise the T-Beam AP IP as the NTP server with DHCP option 42.',
 dnsAliases:'Answer configured NTP hostnames with the T-Beam AP IP so clients already pointed at public time servers still work off-grid.',
 dnsWildcard:'Answer other DNS names with the T-Beam AP IP for captive portal discovery and easier onboarding.',
 ntpHosts:'One NTP hostname per line. These names are answered locally by DNS in standalone AP mode.',
-observeDst:'Use the POSIX TZ rule for local display time, including daylight-saving transitions.',
-posixTimezone:'POSIX timezone rule for local display time. Example: PST8PDT,M3.2.0/2,M11.1.0/2.',
-autoOffset:'Fallback only when POSIX TZ/DST is disabled: estimate local offset from GPS longitude.',
-manualOffset:'Fallback only when POSIX TZ/DST and auto fallback are disabled. Minutes east of UTC are positive.',
+timeModeOffset:'Use a fixed UTC offset entered as hours and minutes. This mode does not apply daylight-saving changes.',
+timeModeIana:'Choose a current timezone preset loaded from the editable LittleFS timezone file.',
+timeModePosix:'Use the POSIX TZ rule string exactly as entered below.',
+offsetSign:'Direction of the local offset from UTC. UTC- is used west of Greenwich, such as US time zones.',
+offsetHours:'Hour portion of the fixed UTC offset. The firmware converts this to minutes internally.',
+offsetMinutes:'Minute portion of the fixed UTC offset. Use values like 30 or 45 for half-hour and quarter-hour zones.',
+ianaTimeZone:'Timezone preset name loaded from /timezones.current.tsv. If the file is removed, this mode falls back to the POSIX rule field.',
+tzDbNote:'The timezone preset file is current-as-of data in LittleFS. It can be edited, replaced, or removed without breaking offset/POSIX modes.',
+posixTimezone:'Manual POSIX timezone rule for local display time. Example: PST8PDT,M3.2.0/2,M11.1.0/2.',
+observeDst:'Compatibility field retained for older saved settings.',
+autoOffset:'Compatibility field retained for older saved settings.',
+manualOffset:'Internal fixed UTC offset in minutes, generated from the hour/minute controls.',
 chargeEnabled:'Allow AXP192 battery charging using the configured current and voltage limits.',
 chargeCurrent:'Li-Ion charge current limit. Conservative values reduce heat and battery stress.',
 chargeVoltage:'Li-Ion charge termination voltage. 4100 mV is conservative; 4200 mV maximizes capacity.',
@@ -1539,12 +1698,18 @@ function applyTooltips(){Object.keys(tips).forEach(id=>{const el=$(id);if(!el)re
 function offsetLabel(m){const s=m>=0?'+':'-';const a=Math.abs(m||0);return `UTC${s}${String(Math.floor(a/60)).padStart(2,'0')}:${String(a%60).padStart(2,'0')}`}
 async function getJson(url,opts){const r=await fetch(url,opts);if(!r.ok)throw new Error(await r.text());return r.json()}
 function setMsg(t,c=''){const el=$('message');el.textContent=t;el.className='muted '+c}
+function setOffsetControls(minutes){const m=Number(minutes)||0;$('offsetSign').value=m<0?'-1':'1';const a=Math.abs(m);$('offsetHours').value=Math.floor(a/60);$('offsetMinutes').value=a%60;$('manualOffset').value=m}
+function offsetFromControls(){const sign=+$('offsetSign').value||1;const h=Math.min(14,Math.max(0,+$('offsetHours').value||0));const m=Math.min(59,Math.max(0,+$('offsetMinutes').value||0));return sign*(h*60+m)}
+function setTimeMode(mode){const id='timeMode'+String(mode||'iana').replace(/^./,c=>c.toUpperCase());const el=$(id)||$('timeModeIana');el.checked=true}
+function getTimeMode(){const el=document.querySelector('input[name="timeMode"]:checked');return el?el.value:'iana'}
+function populateTimeZones(selected){const sel=$('ianaTimeZone');sel.innerHTML='';if(!timeZoneRows.length){const o=document.createElement('option');o.value=selected||'';o.textContent='Timezone file missing';sel.appendChild(o);sel.disabled=true;$('tzDbNote').textContent='Timezone preset file not found. Offset and POSIX modes still work.';return}sel.disabled=false;timeZoneRows.forEach(z=>{const o=document.createElement('option');o.value=z.name;o.textContent=z.name;sel.appendChild(o)});sel.value=selected||'America/Los_Angeles';if(sel.value!==selected&&selected){const o=document.createElement('option');o.value=selected;o.textContent=selected+' (not in file)';sel.insertBefore(o,sel.firstChild);sel.value=selected}$('tzDbNote').textContent=timeZoneDbNote}
+async function loadTimeZones(){try{const r=await fetch('/api/timezones');if(!r.ok)throw new Error('missing');const text=await r.text();timeZoneRows=text.split(/\r?\n/).map(x=>x.trim()).filter(x=>x&&!x.startsWith('#')).map(x=>{const p=x.split('\t');return{name:p[0],posix:p.slice(1).join('\t')}}).filter(x=>x.name&&x.posix);const currentLine=text.split(/\r?\n/).find(x=>x.startsWith('# Current-as-of:'));timeZoneDbNote=currentLine?`Timezone presets ${currentLine.replace('# ','').toLowerCase()} from /timezones.current.tsv.`:'Timezone presets loaded from /timezones.current.tsv.'}catch(e){timeZoneRows=[];timeZoneDbNote='Timezone preset file not found. Offset and POSIX modes still work.'}}
 function fillSettings(s){
 current=s;const d=s.display||{},t=s.time||{};
-$('hostname').value=s.hostname||'';$('staSsid').value=s.wifi.ssid||'';$('staPass').value=s.wifi.password||'';$('staDhcp').checked=!!s.wifi.dhcp;$('staticIp').value=s.wifi.staticIp;$('gateway').value=s.wifi.gateway;$('subnet').value=s.wifi.subnet;$('dns1').value=s.wifi.dns1;$('connectTimeout').value=s.wifi.connectTimeoutSec;$('apSsid').value=s.ap.ssid;$('apPass').value=s.ap.password;$('apIp').value=s.ap.ip;$('apSubnet').value=s.ap.subnet;$('apChannel').value=s.ap.channel;$('apMax').value=s.ap.maxClients;$('opt42').checked=!!s.standalone.dhcpOption42;$('dnsAliases').checked=!!s.standalone.dnsNtpAliases;$('dnsWildcard').checked=!!s.standalone.dnsWildcardCaptive;$('ntpHosts').value=(s.standalone.ntpHosts||[]).join('\n');$('observeDst').checked=t.observeDst!==false;$('posixTimezone').value=t.posixTimezone||'PST8PDT,M3.2.0/2,M11.1.0/2';$('autoOffset').checked=!!t.autoLocalOffset;$('manualOffset').value=t.manualOffsetMinutes??0;$('chargeEnabled').checked=!!s.power.chargeEnabled;$('chargeCurrent').value=s.power.chargeCurrentMa;$('chargeVoltage').value=s.power.chargeTargetMv;$('vbusLimit').value=s.power.vbusCurrentLimitMa;$('warnVoltage').value=s.power.warningVoltageMv;$('cutoffVoltage').value=s.power.cutoffVoltageMv;$('sysDown').value=s.power.sysPowerDownMv;$('powerKey').value=s.power.powerKeyOffSeconds;$('oledCycle').checked=d.autoCycle!==false;$('oledCycleSeconds').value=d.cycleSeconds||5;$('screenTimeout').value=d.screensaverTimeoutSec??300;const ex=s.ap.expandedSsid||s.ap.ssid||'';$('apSsidNote').textContent=`Use {mac} to insert this unit's last six MAC hex digits. Current AP SSID: ${ex}.`}
-function readSettings(){return{hostname:$('hostname').value,wifi:{ssid:$('staSsid').value,password:$('staPass').value,dhcp:$('staDhcp').checked,staticIp:$('staticIp').value,gateway:$('gateway').value,subnet:$('subnet').value,dns1:$('dns1').value,dns2:(current.wifi&&current.wifi.dns2)||'1.1.1.1',connectTimeoutSec:+$('connectTimeout').value},ap:{ssid:$('apSsid').value,password:$('apPass').value,ip:$('apIp').value,subnet:$('apSubnet').value,channel:+$('apChannel').value,maxClients:+$('apMax').value},standalone:{dhcpOption42:$('opt42').checked,dnsNtpAliases:$('dnsAliases').checked,dnsWildcardCaptive:$('dnsWildcard').checked,ntpHosts:$('ntpHosts').value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean)},time:{observeDst:$('observeDst').checked,posixTimezone:$('posixTimezone').value.trim(),autoLocalOffset:$('autoOffset').checked,manualOffsetMinutes:+$('manualOffset').value},display:{autoCycle:$('oledCycle').checked,cycleSeconds:+$('oledCycleSeconds').value,screensaverTimeoutSec:+$('screenTimeout').value},power:{chargeEnabled:$('chargeEnabled').checked,chargeCurrentMa:+$('chargeCurrent').value,chargeTargetMv:+$('chargeVoltage').value,vbusCurrentLimitMa:+$('vbusLimit').value,warningVoltageMv:+$('warnVoltage').value,cutoffVoltageMv:+$('cutoffVoltage').value,sysPowerDownMv:+$('sysDown').value,powerKeyOffSeconds:+$('powerKey').value}}}
+$('hostname').value=s.hostname||'';$('staSsid').value=s.wifi.ssid||'';$('staPass').value=s.wifi.password||'';$('staDhcp').checked=!!s.wifi.dhcp;$('staticIp').value=s.wifi.staticIp;$('gateway').value=s.wifi.gateway;$('subnet').value=s.wifi.subnet;$('dns1').value=s.wifi.dns1;$('connectTimeout').value=s.wifi.connectTimeoutSec;$('apSsid').value=s.ap.ssid;$('apPass').value=s.ap.password;$('apIp').value=s.ap.ip;$('apSubnet').value=s.ap.subnet;$('apChannel').value=s.ap.channel;$('apMax').value=s.ap.maxClients;$('opt42').checked=!!s.standalone.dhcpOption42;$('dnsAliases').checked=!!s.standalone.dnsNtpAliases;$('dnsWildcard').checked=!!s.standalone.dnsWildcardCaptive;$('ntpHosts').value=(s.standalone.ntpHosts||[]).join('\n');setTimeMode(t.mode||((t.observeDst===false)?'offset':'posix'));setOffsetControls(t.manualOffsetMinutes??0);populateTimeZones(t.ianaTimeZone||'America/Los_Angeles');$('posixTimezone').value=t.posixTimezone||'PST8PDT,M3.2.0/2,M11.1.0/2';$('observeDst').value='';$('autoOffset').value='';$('chargeEnabled').checked=!!s.power.chargeEnabled;$('chargeCurrent').value=s.power.chargeCurrentMa;$('chargeVoltage').value=s.power.chargeTargetMv;$('vbusLimit').value=s.power.vbusCurrentLimitMa;$('warnVoltage').value=s.power.warningVoltageMv;$('cutoffVoltage').value=s.power.cutoffVoltageMv;$('sysDown').value=s.power.sysPowerDownMv;$('powerKey').value=s.power.powerKeyOffSeconds;$('oledCycle').checked=d.autoCycle!==false;$('oledCycleSeconds').value=d.cycleSeconds||5;$('screenTimeout').value=d.screensaverTimeoutSec??300;const ex=s.ap.expandedSsid||s.ap.ssid||'';$('apSsidNote').textContent=`Use {mac} to insert this unit's last six MAC hex digits. Current AP SSID: ${ex}.`}
+function readSettings(){const mode=getTimeMode(),offset=offsetFromControls();return{hostname:$('hostname').value,wifi:{ssid:$('staSsid').value,password:$('staPass').value,dhcp:$('staDhcp').checked,staticIp:$('staticIp').value,gateway:$('gateway').value,subnet:$('subnet').value,dns1:$('dns1').value,dns2:(current.wifi&&current.wifi.dns2)||'1.1.1.1',connectTimeoutSec:+$('connectTimeout').value},ap:{ssid:$('apSsid').value,password:$('apPass').value,ip:$('apIp').value,subnet:$('apSubnet').value,channel:+$('apChannel').value,maxClients:+$('apMax').value},standalone:{dhcpOption42:$('opt42').checked,dnsNtpAliases:$('dnsAliases').checked,dnsWildcardCaptive:$('dnsWildcard').checked,ntpHosts:$('ntpHosts').value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean)},time:{mode,ianaTimeZone:$('ianaTimeZone').value,posixTimezone:$('posixTimezone').value.trim(),autoLocalOffset:false,observeDst:mode!=='offset',manualOffsetMinutes:offset},display:{autoCycle:$('oledCycle').checked,cycleSeconds:+$('oledCycleSeconds').value,screensaverTimeoutSec:+$('screenTimeout').value},power:{chargeEnabled:$('chargeEnabled').checked,chargeCurrentMa:+$('chargeCurrent').value,chargeTargetMv:+$('chargeVoltage').value,vbusCurrentLimitMa:+$('vbusLimit').value,warningVoltageMv:+$('warnVoltage').value,cutoffVoltageMv:+$('cutoffVoltage').value,sysPowerDownMv:+$('sysDown').value,powerKeyOffSeconds:+$('powerKey').value}}}
 async function refreshStatus(){try{const s=await getJson('/api/status');$('topline').textContent=`${s.mode} ${s.ip} | UTC ${s.utc||'not synced'} | Local ${s.local||'not synced'} | clients ${s.clients}`;let gps=s.gps.fix?'ok':(s.gps.seen?'warn':'bad');let pwr=s.power.online?(s.power.warning?'warn':'ok'):'warn';let tz=s.timeZone?`${s.timeZone} ${s.dstActive?'DST':'STD'}`:offsetLabel(s.localOffsetMinutes);$('status').innerHTML=metric('Mode',s.mode)+metric('Version',s.version||'')+metric('IP',s.ip)+metric('UTC',s.utc||'not synced',s.clock.synced?'ok':'bad')+metric('Local',s.local||'not synced',s.clock.synced?'ok':'bad')+metric('TZ',tz)+metric('PPS',s.clock.pps?'locked':'waiting',s.clock.pps?'ok':'warn')+metric('GPS',`${s.gps.sats} sats ${s.gps.grid||''}`,gps)+metric('Location',s.gps.fix?`${s.gps.lat.toFixed(6)}, ${s.gps.lon.toFixed(6)}`:'no fix')+metric('Altitude',s.gps.fix?`${s.gps.alt.toFixed(1)} m`:'')+metric('DOP',s.gps.dop||'')+metric('Battery',s.power.online?(s.power.batteryPresent?`${s.power.batteryMv} mV ${s.power.batteryCurrentMa.toFixed(0)} mA`:'no battery'):'PMU offline',pwr)+metric('VBUS',s.power.online?`${s.power.vbusMv} mV ${s.power.vbusCurrentMa.toFixed(0)} mA`:'')+metric('NTP/DNS',`${s.ntpRequests}/${s.ntpSuppressed} / ${s.dnsQueries}`)+metric('Heap',`${s.heap.free} free, PSRAM ${s.heap.psramFree}`)}catch(e){setMsg(e.message,'bad')}}
-async function load(){applyTooltips();fillSettings(await getJson('/api/settings'));refreshStatus();setInterval(refreshStatus,2000)}
+async function load(){applyTooltips();await loadTimeZones();fillSettings(await getJson('/api/settings'));refreshStatus();setInterval(refreshStatus,2000)}
 $('saveBtn').onclick=async()=>{try{setMsg('Saving');await getJson('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(readSettings())});setMsg('Saved. Reboot to apply network changes.','ok')}catch(e){setMsg(e.message,'bad')}};
 $('rebootBtn').onclick=async()=>{if(confirm('Reboot now?')){await fetch('/api/reboot',{method:'POST'});setMsg('Rebooting')}};
 $('scanBtn').onclick=async()=>{try{setMsg('Scanning');const s=await getJson('/api/scan');const list=$('scanList');list.innerHTML='';s.networks.forEach(n=>{const o=document.createElement('option');o.value=n.ssid;o.label=`${n.rssi} dBm ch ${n.channel}`;list.appendChild(o)});setMsg(`Found ${s.networks.length} networks`)}catch(e){setMsg(e.message,'bad')}};
@@ -1568,6 +1733,17 @@ static void handleSettingsGet() {
   DynamicJsonDocument doc(12288);
   settingsToJson(doc);
   sendJson(doc);
+}
+
+static void handleTimezones() {
+  File file = LittleFS.open(TIMEZONE_DB_PATH, "r");
+  if (!file) {
+    server.send(404, "text/plain", "timezone preset file not found");
+    return;
+  }
+  server.sendHeader("Cache-Control", "no-store");
+  server.streamFile(file, "text/tab-separated-values");
+  file.close();
 }
 
 static void handleSettingsSave() {
@@ -1628,6 +1804,9 @@ static void handleStatus() {
   doc["local"] = servingTime ? formatLocal(nowUsec) : "";
   doc["localOffsetMinutes"] = localOffset;
   doc["timeZone"] = servingTime ? localTimezoneName(nowUsec) : "";
+  doc["localTimeMode"] = localTimeModeName(settings.localTimeMode);
+  doc["ianaTimeZone"] = settings.ianaTimeZone;
+  doc["timeZoneDatabasePresent"] = littleFsFileExists(TIMEZONE_DB_PATH);
   doc["dstActive"] = servingTime && isLocalDstActive(nowUsec);
   doc["ntpRequests"] = ntpRequestCount;
   doc["ntpSuppressed"] = ntpSuppressedCount;
@@ -1695,6 +1874,7 @@ static void handleNotFound() {
 static void beginWeb() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/settings", HTTP_GET, handleSettingsGet);
+  server.on("/api/timezones", HTTP_GET, handleTimezones);
   server.on("/api/save", HTTP_POST, handleSettingsSave);
   server.on("/api/scan", HTTP_GET, handleScan);
   server.on("/api/status", HTTP_GET, handleStatus);
@@ -1859,15 +2039,6 @@ static void factoryResetSettings(const char *reason) {
   ESP.restart();
 }
 
-static void requestFactoryResetConfirmation(const char *reason) {
-  Serial.printf("Factory reset confirmation requested: %s\n", reason ? reason : "user button");
-  factoryResetConfirmPending = true;
-  factoryResetConfirmUntilMs = millis() + FACTORY_RESET_CONFIRM_WINDOW_MS;
-  pauseOledAutoCycle();
-  wakeOled();
-  showResetConfirmPrompt();
-}
-
 static void checkBootFactoryReset() {
   if (digitalRead(PIN_USER_BUTTON) != LOW) {
     return;
@@ -1900,9 +2071,8 @@ static void checkBootFactoryReset() {
     return;
   }
 
-  factoryResetConfirmPending = true;
-  factoryResetConfirmUntilMs = millis() + FACTORY_RESET_CONFIRM_WINDOW_MS;
-  while (beforeDeadline(factoryResetConfirmUntilMs)) {
+  uint32_t confirmUntilMs = millis() + FACTORY_RESET_CONFIRM_WINDOW_MS;
+  while (beforeDeadline(confirmUntilMs)) {
     if (digitalRead(PIN_USER_BUTTON) == LOW) {
       uint32_t confirmStart = millis();
       while (digitalRead(PIN_USER_BUTTON) == LOW) {
@@ -1912,7 +2082,6 @@ static void checkBootFactoryReset() {
         delay(50);
       }
       Serial.println("Reset confirmation press released early; forcing AP mode for this boot");
-      factoryResetConfirmPending = false;
       bootForceApMode = true;
       showBootForceApPrompt();
       delay(900);
@@ -1922,7 +2091,6 @@ static void checkBootFactoryReset() {
   }
 
   Serial.println("Reset confirmation timed out; forcing AP mode for this boot");
-  factoryResetConfirmPending = false;
   bootForceApMode = true;
   showBootForceApPrompt();
   delay(900);
@@ -1937,14 +2105,6 @@ static void updateOled() {
     return;
   }
   splashUntilMs = 0;
-
-  if (factoryResetConfirmPending) {
-    if (beforeDeadline(factoryResetConfirmUntilMs) || factoryResetConfirmHoldArmed) {
-      return;
-    }
-    factoryResetConfirmPending = false;
-    lastOledUpdateMs = 0;
-  }
 
   uint64_t nowUsec = 0;
   bool synced = getClockUnixUsec(nowUsec);
@@ -2032,7 +2192,6 @@ static void handleUserButton() {
   static bool stableState = true;
   static uint32_t lastEdgeMs = 0;
   static uint32_t pressedAtMs = 0;
-  static bool longPressHandled = false;
   static bool pressWokeDisplay = false;
 
   bool rawState = digitalRead(PIN_USER_BUTTON);
@@ -2048,32 +2207,17 @@ static void handleUserButton() {
     stableState = rawState;
     if (stableState == LOW) {
       pressedAtMs = millis();
-      longPressHandled = false;
       pressWokeDisplay = oledSleeping;
-      factoryResetConfirmHoldArmed = factoryResetConfirmPending && beforeDeadline(factoryResetConfirmUntilMs);
       wakeOled();
       pauseOledAutoCycle();
     } else {
       uint32_t pressDuration = pressedAtMs ? millis() - pressedAtMs : 0;
-      if (!longPressHandled && !pressWokeDisplay && pressDuration < USER_BUTTON_FACTORY_RESET_MS) {
+      if (!pressWokeDisplay && pressDuration < USER_BUTTON_FACTORY_RESET_MS) {
         oledPage = (oledPage + 1) % OLED_PAGE_COUNT;
         pauseOledAutoCycle();
         lastOledUpdateMs = 0;
       }
-      factoryResetConfirmHoldArmed = false;
       pressedAtMs = 0;
-    }
-  }
-
-  if (stableState == LOW && pressedAtMs != 0 && !longPressHandled &&
-      millis() - pressedAtMs >= USER_BUTTON_FACTORY_RESET_MS) {
-    longPressHandled = true;
-    if (factoryResetConfirmHoldArmed) {
-      factoryResetSettings("runtime confirmed button hold");
-    } else {
-      factoryResetConfirmPending = false;
-      factoryResetConfirmHoldArmed = false;
-      requestFactoryResetConfirmation("runtime button hold");
     }
   }
 }

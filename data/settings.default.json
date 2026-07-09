@@ -67,7 +67,9 @@
     ]
   },
   "time": {
-    "autoLocalOffset": true,
+    "mode": "iana",
+    "ianaTimeZone": "America/Los_Angeles",
+    "autoLocalOffset": false,
     "manualOffsetMinutes": 0,
     "observeDst": true,
     "posixTimezone": "PST8PDT,M3.2.0/2,M11.1.0/2"

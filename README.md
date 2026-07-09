@@ -14,21 +14,19 @@ NTP itself is always UTC. Local time and daylight-saving settings only affect th
 - In AP mode, DHCP can advertise the T-Beam itself as the NTP server with DHCP option 42.
 - In AP mode, local DNS can answer common public NTP hostnames with the T-Beam IP.
 - Provides a captive portal for WiFi onboarding, AP settings, NTP alias settings, display settings, local time settings, and conservative Li-Ion power settings.
-- Captive portal sections are collapsible and show caret indicators for collapsed/expanded state.
+
 - Shows GPS, UTC, local time, Grid Square / Maidenhead locator, WiFi, and power status on the onboard OLED.
 - Never transmits LoRa. Bluetooth is not used by the firmware.
 
 ## Current Build
 
-- Firmware version: `v0.1.2`
+- Firmware version: `v0.1.3`
 - PlatformIO environment: `ttgo-t-beam`
 - Upload port: `COM28`
 - Filesystem: LittleFS, 1 MB at `0x300000`
 - App partition: no OTA, about 3 MB
 - Bluetooth: not used by the firmware
 - LoRa: no LoRa library is initialized and no transmit path is used; AXP192 LDO2 is disabled by default
-
-The workspace path contains a comma, so `platformio.ini` sets `build_dir` under `C:/Users/andy.baker/.platformio/build/tbeam_ntp_server` to avoid a Windows linker map-file issue.
 
 ## Flash
 
@@ -70,7 +68,7 @@ NTP intentionally fails closed: requests are counted but no NTP response is sent
 
 ## LAN Mode
 
-The T-Beam can also join an existing WiFi network. In that mode it serves NTP on its assigned or static IPv4 address. Your router or clients can then be configured to use the T-Beam IP or hostname as an NTP source.
+The T-Beam can also join an existing WiFi network. In that mode it serves NTP on its assigned or static IPv4 address. Your router or clients can then be configured to use the T-Beam IP or hostname as an NTP source. DHCP and DNS servers are inactive, since it's assumed that the local router will be handling these services.
 
 ## Hardware Assumptions
 
@@ -84,9 +82,15 @@ The firmware tolerates missing OLED, missing battery, and absent optional I2C se
 
 ## Local Time And DST
 
-UTC comes from GPS. Local display time can use an editable POSIX TZ rule string, which is the compact standard format supported by embedded C runtimes for timezone and daylight-saving rules.
+UTC comes from GPS. Local display time is display-only and does not affect NTP. The portal supports three local-time modes:
 
-The default rule is US Pacific time:
+- Fixed UTC offset, entered as sign, hours, and minutes.
+- Timezone preset, selected from `data/timezones.current.tsv`.
+- Manual POSIX TZ rule string.
+
+The timezone preset file is deliberately separate from the firmware logic. It is generated from IANA tzdata `2026c`, current as of July 9, 2026, and omits historical transitions. It can be edited, replaced, or removed; fixed-offset and manual POSIX modes still work without it.
+
+The default timezone preset is `America/Los_Angeles`. The fallback/manual POSIX rule is US Pacific time:
 
 ```text
 PST8PDT,M3.2.0/2,M11.1.0/2
@@ -100,22 +104,18 @@ Examples:
 - US Mountain without DST, such as most of Arizona: `MST7`
 - UTC: `UTC0`
 
-If the POSIX TZ/DST option is disabled, the firmware falls back to either the rough GPS-longitude offset or the manual offset in minutes.
+The firmware does not carry a full historical IANA TZif database. That is intentional: for this device, local time is for the OLED and portal, while NTP remains UTC.
 
 ## OLED And Button
 
 The OLED cycles screens every 5 seconds by default. The cycle setting and screensaver timeout are configurable in the portal. Manual cycling pauses automatic cycling for 30 seconds; the screensaver timeout still applies normally.
 
-Dedicated large-format screens are provided for UTC time, local time, and the Grid Square / Maidenhead locator. Other screens show GPS detail, network state, connected AP clients, and power status.
+The user button wakes the screen. A short press cycles screens when the display is awake.
 
-The user button wakes the screen. A short press cycles screens when the display is awake. Long AP SSID and AP password values scroll on the OLED network page.
+Factory Reset
 
-Boot button behavior:
-
-- Hold the user button during boot and release it before 10 seconds to force standalone AP mode for that boot.
-- Hold it for 10 seconds at boot to request factory reset, then release and hold again for 10 seconds within the confirmation window to clear saved settings.
-
-Runtime reset uses the same confirmation model: hold for 10 seconds to show the reset confirmation screen, then hold again for 10 seconds to reset.
+- Hold the user button during boot and release it BEFORE 10 seconds to force standalone AP mode for that boot.
+- Hold the user button for 10 seconds at boot to request factory reset, then release and hold again for 10 seconds within the confirmation window to clear saved settings.
 
 ## Power Defaults
 
@@ -139,6 +139,6 @@ For low-rate DHCP/DNS/NTP traffic, 8 clients is a reasonable starting point on t
 
 ## Known Limitations
 
-- The POSIX TZ rule is editable, but the firmware does not carry a full IANA timezone database. That is deliberate: the ESP32 flash budget is better spent on the captive portal and field reliability.
+- Timezone presets are current-as-of data, not a historical IANA TZif database.
 - PPS discipline is implemented in firmware using GPS NMEA plus the PPS interrupt. It is suitable for this embedded NTP role, but it is not a full temperature-compensated oscillator PLL.
 - DHCP option 42 is configured through the ESP32 lwIP DHCP server option hook. Some clients do not visibly report received option 42 even when they accept the DHCP lease.
