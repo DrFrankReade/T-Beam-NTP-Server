@@ -57,6 +57,8 @@ With no configured home WiFi, the device starts in AP mode:
 - NTP: UDP/123 on the device IP
 - DNS: UDP/53 on the device IP
 
+The `{mac}` placeholder in the default AP SSID is expanded by the firmware to the last six hex digits of the unit MAC address, for example `TBeam-NTP-55B594`.
+
 In AP mode, DHCP advertises the T-Beam as DNS and, when enabled, NTP server via DHCP option 42. DNS answers editable NTP aliases such as `time.cloudflare.com`, `time.google.com`, `time.nist.gov`, `pool.ntp.org`, and common OS time hosts with the T-Beam AP IP.
 
 This is intentional. It reduces client configuration when there is no internet and users already have devices configured for common public time servers.
