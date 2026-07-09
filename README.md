@@ -20,7 +20,7 @@ NTP itself is always UTC. Local time and daylight-saving settings only affect th
 
 ## Current Build
 
-- Firmware version: `v0.1.3`
+- Firmware version: `v0.1.4`
 - PlatformIO environment: `ttgo-t-beam`
 - Upload port: `COM28`
 - Filesystem: LittleFS, 1 MB at `0x300000`
