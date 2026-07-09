@@ -1,0 +1,1855 @@
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <LittleFS.h>
+#include <TinyGPS++.h>
+#include <WebServer.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <Wire.h>
+#include <ESPmDNS.h>
+#include <SSD1306Wire.h>
+#include <XPowersLib.h>
+
+#include <esp_timer.h>
+#include <esp_wifi.h>
+#include <stdlib.h>
+#include <sys/time.h>
+#include <time.h>
+
+extern "C" {
+#include "dhcpserver/dhcpserver.h"
+#include "dhcpserver/dhcpserver_options.h"
+#include "lwip/ip_addr.h"
+}
+
+#if CONFIG_BT_ENABLED
+#include <esp_bt.h>
+#endif
+
+static constexpr uint8_t PIN_I2C_SDA = 21;
+static constexpr uint8_t PIN_I2C_SCL = 22;
+static constexpr uint8_t PIN_PMU_IRQ = 35;
+static constexpr uint8_t PIN_GPS_RX = 34;
+static constexpr uint8_t PIN_GPS_TX = 12;
+static constexpr uint8_t PIN_GPS_PPS = 37;
+static constexpr uint8_t PIN_USER_BUTTON = 38;
+
+static constexpr uint32_t SERIAL_BAUD = 115200;
+static constexpr uint32_t GPS_BAUD = 9600;
+static constexpr uint16_t NTP_PORT = 123;
+static constexpr uint16_t DNS_PORT = 53;
+static constexpr size_t MAX_NTP_HOSTS = 64;
+static constexpr size_t POSIX_TZ_MAX_LEN = 96;
+static constexpr uint64_t UNIX_TO_NTP_SECONDS = 2208988800ULL;
+static constexpr uint8_t OLED_PAGE_COUNT = 6;
+static constexpr uint32_t USER_BUTTON_FACTORY_RESET_MS = 10000;
+static constexpr const char *DEFAULT_POSIX_TZ = "PST8PDT,M3.2.0/2,M11.1.0/2";
+
+enum class NetworkMode {
+  ApFallback,
+  Sta
+};
+
+struct DeviceSettings {
+  char hostname[32];
+
+  char staSsid[33];
+  char staPassword[65];
+  bool staDhcp;
+  IPAddress staIp;
+  IPAddress staGateway;
+  IPAddress staSubnet;
+  IPAddress staDns1;
+  IPAddress staDns2;
+  uint8_t staConnectTimeoutSec;
+
+  char apSsid[33];
+  char apPassword[65];
+  IPAddress apIp;
+  IPAddress apSubnet;
+  uint8_t apChannel;
+  uint8_t apMaxClients;
+
+  bool dhcpOption42;
+  bool dnsNtpAliases;
+  bool dnsWildcardCaptive;
+  String ntpHosts[MAX_NTP_HOSTS];
+  size_t ntpHostCount;
+
+  bool autoLocalOffset;
+  int16_t manualOffsetMinutes;
+  bool observeDst;
+  char posixTimezone[POSIX_TZ_MAX_LEN];
+
+  bool oledAutoCycle;
+  uint8_t oledCycleSeconds;
+  uint16_t oledScreensaverTimeoutSec;
+
+  bool chargeEnabled;
+  uint16_t chargeCurrentMa;
+  uint16_t chargeTargetMv;
+  uint16_t vbusCurrentLimitMa;
+  uint16_t warningVoltageMv;
+  uint16_t cutoffVoltageMv;
+  uint16_t sysPowerDownMv;
+  uint8_t powerKeyOffSeconds;
+};
+
+struct PowerState {
+  bool online = false;
+  bool batteryPresent = false;
+  bool charging = false;
+  bool discharging = false;
+  bool vbusPresent = false;
+  uint16_t batteryMv = 0;
+  float batteryCurrentMa = 0.0f;
+  uint16_t vbusMv = 0;
+  float vbusCurrentMa = 0.0f;
+  uint16_t systemMv = 0;
+  float temperatureC = 0.0f;
+  int batteryPercent = -1;
+  bool warning = false;
+  bool cutoffPending = false;
+};
+
+static DeviceSettings settings;
+static PowerState powerState;
+static WebServer server(80);
+static WiFiUDP ntpUdp;
+static WiFiUDP dnsUdp;
+static HardwareSerial GPSSerial(1);
+static TinyGPSPlus gps;
+static TinyGPSCustom pdopGp(gps, "GPGSA", 15);
+static TinyGPSCustom hdopGp(gps, "GPGSA", 16);
+static TinyGPSCustom vdopGp(gps, "GPGSA", 17);
+static TinyGPSCustom pdopGn(gps, "GNGSA", 15);
+static TinyGPSCustom hdopGn(gps, "GNGSA", 16);
+static TinyGPSCustom vdopGn(gps, "GNGSA", 17);
+static SSD1306Wire display(0x3C, PIN_I2C_SDA, PIN_I2C_SCL);
+static XPowersPMU pmu;
+
+static NetworkMode networkMode = NetworkMode::ApFallback;
+static bool oledOnline = false;
+static bool ntpOnline = false;
+static bool dnsOnline = false;
+static bool mdnsOnline = false;
+static uint32_t ntpRequestCount = 0;
+static uint32_t ntpSuppressedCount = 0;
+static uint32_t dnsQueryCount = 0;
+static uint32_t dnsAliasHitCount = 0;
+static uint32_t staLostSinceMs = 0;
+static uint32_t lowBatterySinceMs = 0;
+static uint32_t lastPowerPollMs = 0;
+static uint32_t lastOledUpdateMs = 0;
+static uint32_t lastOledCycleMs = 0;
+static uint32_t lastOledActivityMs = 0;
+static uint32_t lastI2cScanMs = 0;
+static String activePosixTimezone;
+static bool posixTimezoneApplied = false;
+static String i2cDevices = "";
+static uint8_t oledPage = 0;
+static bool oledSleeping = false;
+static bool lastDisplayGpsFix = false;
+
+static portMUX_TYPE ppsMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool ppsPending = false;
+static volatile uint64_t isrPpsUsec = 0;
+static volatile uint32_t isrPpsCount = 0;
+static volatile bool pmuIrqPending = false;
+
+static bool clockValid = false;
+static bool clockPpsDisciplined = false;
+static uint64_t clockAnchorUsec = 0;
+static time_t clockAnchorEpoch = 0;
+static uint64_t lastPpsUsec = 0;
+static uint32_t lastPpsMs = 0;
+static uint32_t lastClockSyncMs = 0;
+static time_t lastNmeaEpoch = 0;
+static uint32_t lastNmeaUpdateMs = 0;
+
+static void copyText(char *dst, size_t len, const char *src) {
+  if (len == 0) {
+    return;
+  }
+  if (!src) {
+    src = "";
+  }
+  snprintf(dst, len, "%s", src);
+}
+
+static void copyPosixTimezone(char *dst, size_t len, const char *src) {
+  if (len == 0) {
+    return;
+  }
+  if (!src) {
+    src = "";
+  }
+
+  size_t out = 0;
+  for (size_t i = 0; src[i] != '\0' && out + 1 < len; ++i) {
+    char c = src[i];
+    if (c >= 33 && c <= 126) {
+      dst[out++] = c;
+    }
+  }
+  dst[out] = '\0';
+}
+
+static uint16_t clampU16(uint16_t value, uint16_t low, uint16_t high) {
+  if (value < low) {
+    return low;
+  }
+  if (value > high) {
+    return high;
+  }
+  return value;
+}
+
+static int16_t clampI16(int16_t value, int16_t low, int16_t high) {
+  if (value < low) {
+    return low;
+  }
+  if (value > high) {
+    return high;
+  }
+  return value;
+}
+
+static IPAddress parseIp(const char *text, IPAddress fallback) {
+  IPAddress ip;
+  if (text && ip.fromString(text)) {
+    return ip;
+  }
+  return fallback;
+}
+
+static String ipToString(const IPAddress &ip) {
+  return ip.toString();
+}
+
+static String normalizeHost(String host) {
+  host.trim();
+  host.toLowerCase();
+  while (host.endsWith(".")) {
+    host.remove(host.length() - 1);
+  }
+  return host;
+}
+
+static void addNtpHost(const String &rawHost) {
+  String host = normalizeHost(rawHost);
+  if (host.length() == 0 || settings.ntpHostCount >= MAX_NTP_HOSTS) {
+    return;
+  }
+  for (size_t i = 0; i < settings.ntpHostCount; ++i) {
+    if (settings.ntpHosts[i] == host) {
+      return;
+    }
+  }
+  settings.ntpHosts[settings.ntpHostCount++] = host;
+}
+
+static void addDefaultNtpHosts() {
+  const char *defaults[] = {
+      "time.cloudflare.com", "time.google.com", "time1.google.com",
+      "time2.google.com", "time3.google.com", "time4.google.com",
+      "time.android.com", "time.apple.com", "time-ios.apple.com",
+      "time.windows.com", "pool.ntp.org", "0.pool.ntp.org",
+      "1.pool.ntp.org", "2.pool.ntp.org", "3.pool.ntp.org",
+      "us.pool.ntp.org", "0.us.pool.ntp.org", "1.us.pool.ntp.org",
+      "2.us.pool.ntp.org", "3.us.pool.ntp.org",
+      "north-america.pool.ntp.org", "time.nist.gov",
+      "time-a-g.nist.gov", "time-b-g.nist.gov", "time-c-g.nist.gov",
+      "time-d-g.nist.gov", "time-a-wwv.nist.gov", "time-b-wwv.nist.gov",
+      "time-a-b.nist.gov", "time-b-b.nist.gov", "ntp.ubuntu.com",
+      "time.aws.com", "time.facebook.com", "time1.facebook.com",
+      "time2.facebook.com", "time3.facebook.com", "time4.facebook.com",
+      "clock.isc.org", "ntp.org", "nist.time.gov"};
+  settings.ntpHostCount = 0;
+  for (const char *host : defaults) {
+    addNtpHost(host);
+  }
+}
+
+static void setHardDefaults() {
+  copyText(settings.hostname, sizeof(settings.hostname), "tbeam-ntp");
+  copyText(settings.staSsid, sizeof(settings.staSsid), "");
+  copyText(settings.staPassword, sizeof(settings.staPassword), "");
+  settings.staDhcp = true;
+  settings.staIp = IPAddress(192, 168, 1, 50);
+  settings.staGateway = IPAddress(192, 168, 1, 1);
+  settings.staSubnet = IPAddress(255, 255, 255, 0);
+  settings.staDns1 = IPAddress(192, 168, 1, 1);
+  settings.staDns2 = IPAddress(1, 1, 1, 1);
+  settings.staConnectTimeoutSec = 25;
+
+  copyText(settings.apSsid, sizeof(settings.apSsid), "TBeam-NTP-{mac}");
+  copyText(settings.apPassword, sizeof(settings.apPassword), "");
+  settings.apIp = IPAddress(192, 168, 4, 1);
+  settings.apSubnet = IPAddress(255, 255, 255, 0);
+  settings.apChannel = 6;
+  settings.apMaxClients = 8;
+
+  settings.dhcpOption42 = true;
+  settings.dnsNtpAliases = true;
+  settings.dnsWildcardCaptive = true;
+  addDefaultNtpHosts();
+
+  settings.autoLocalOffset = true;
+  settings.manualOffsetMinutes = 0;
+  settings.observeDst = true;
+  copyPosixTimezone(settings.posixTimezone, sizeof(settings.posixTimezone), DEFAULT_POSIX_TZ);
+
+  settings.oledAutoCycle = true;
+  settings.oledCycleSeconds = 5;
+  settings.oledScreensaverTimeoutSec = 300;
+
+  settings.chargeEnabled = true;
+  settings.chargeCurrentMa = 280;
+  settings.chargeTargetMv = 4100;
+  settings.vbusCurrentLimitMa = 500;
+  settings.warningVoltageMv = 3500;
+  settings.cutoffVoltageMv = 3200;
+  settings.sysPowerDownMv = 3000;
+  settings.powerKeyOffSeconds = 6;
+}
+
+static bool applySettingsJson(JsonDocument &doc) {
+  if (doc["hostname"].is<const char *>()) {
+    copyText(settings.hostname, sizeof(settings.hostname), doc["hostname"]);
+  }
+
+  JsonObject wifi = doc["wifi"].as<JsonObject>();
+  if (!wifi.isNull()) {
+    if (wifi["ssid"].is<const char *>()) {
+      copyText(settings.staSsid, sizeof(settings.staSsid), wifi["ssid"]);
+    }
+    if (wifi["password"].is<const char *>()) {
+      copyText(settings.staPassword, sizeof(settings.staPassword), wifi["password"]);
+    }
+    settings.staDhcp = wifi["dhcp"] | settings.staDhcp;
+    settings.staIp = parseIp(wifi["staticIp"] | nullptr, settings.staIp);
+    settings.staGateway = parseIp(wifi["gateway"] | nullptr, settings.staGateway);
+    settings.staSubnet = parseIp(wifi["subnet"] | nullptr, settings.staSubnet);
+    settings.staDns1 = parseIp(wifi["dns1"] | nullptr, settings.staDns1);
+    settings.staDns2 = parseIp(wifi["dns2"] | nullptr, settings.staDns2);
+    settings.staConnectTimeoutSec = clampU16(wifi["connectTimeoutSec"] | settings.staConnectTimeoutSec, 5, 90);
+  }
+
+  JsonObject ap = doc["ap"].as<JsonObject>();
+  if (!ap.isNull()) {
+    if (ap["ssid"].is<const char *>()) {
+      copyText(settings.apSsid, sizeof(settings.apSsid), ap["ssid"]);
+    }
+    if (ap["password"].is<const char *>()) {
+      copyText(settings.apPassword, sizeof(settings.apPassword), ap["password"]);
+    }
+    settings.apIp = parseIp(ap["ip"] | nullptr, settings.apIp);
+    settings.apSubnet = parseIp(ap["subnet"] | nullptr, settings.apSubnet);
+    settings.apChannel = clampU16(ap["channel"] | settings.apChannel, 1, 13);
+    settings.apMaxClients = clampU16(ap["maxClients"] | settings.apMaxClients, 1, 10);
+  }
+
+  JsonObject standalone = doc["standalone"].as<JsonObject>();
+  if (!standalone.isNull()) {
+    settings.dhcpOption42 = standalone["dhcpOption42"] | settings.dhcpOption42;
+    settings.dnsNtpAliases = standalone["dnsNtpAliases"] | settings.dnsNtpAliases;
+    settings.dnsWildcardCaptive = standalone["dnsWildcardCaptive"] | settings.dnsWildcardCaptive;
+    if (standalone["ntpHosts"].is<JsonArray>()) {
+      settings.ntpHostCount = 0;
+      for (JsonVariant value : standalone["ntpHosts"].as<JsonArray>()) {
+        if (value.is<const char *>()) {
+          addNtpHost(value.as<const char *>());
+        }
+      }
+    }
+  }
+
+  JsonObject time = doc["time"].as<JsonObject>();
+  if (!time.isNull()) {
+    settings.autoLocalOffset = time["autoLocalOffset"] | settings.autoLocalOffset;
+    settings.manualOffsetMinutes = clampI16(time["manualOffsetMinutes"] | settings.manualOffsetMinutes, -14 * 60, 14 * 60);
+    settings.observeDst = time["observeDst"] | settings.observeDst;
+    if (time["posixTimezone"].is<const char *>()) {
+      copyPosixTimezone(settings.posixTimezone, sizeof(settings.posixTimezone), time["posixTimezone"]);
+    }
+  }
+
+  JsonObject displaySettings = doc["display"].as<JsonObject>();
+  if (!displaySettings.isNull()) {
+    settings.oledAutoCycle = displaySettings["autoCycle"] | settings.oledAutoCycle;
+    settings.oledCycleSeconds = clampU16(displaySettings["cycleSeconds"] | settings.oledCycleSeconds, 2, 60);
+    settings.oledScreensaverTimeoutSec = clampU16(displaySettings["screensaverTimeoutSec"] | settings.oledScreensaverTimeoutSec, 0, 3600);
+  }
+
+  JsonObject power = doc["power"].as<JsonObject>();
+  if (!power.isNull()) {
+    settings.chargeEnabled = power["chargeEnabled"] | settings.chargeEnabled;
+    settings.chargeCurrentMa = clampU16(power["chargeCurrentMa"] | settings.chargeCurrentMa, 100, 700);
+    settings.chargeTargetMv = clampU16(power["chargeTargetMv"] | settings.chargeTargetMv, 4100, 4200);
+    settings.vbusCurrentLimitMa = power["vbusCurrentLimitMa"] | settings.vbusCurrentLimitMa;
+    if (settings.vbusCurrentLimitMa != 100 && settings.vbusCurrentLimitMa != 500 && settings.vbusCurrentLimitMa != 0) {
+      settings.vbusCurrentLimitMa = 500;
+    }
+    settings.warningVoltageMv = clampU16(power["warningVoltageMv"] | settings.warningVoltageMv, 3200, 3900);
+    settings.cutoffVoltageMv = clampU16(power["cutoffVoltageMv"] | settings.cutoffVoltageMv, 3000, 3600);
+    settings.sysPowerDownMv = clampU16(power["sysPowerDownMv"] | settings.sysPowerDownMv, 2600, 3300);
+    settings.powerKeyOffSeconds = power["powerKeyOffSeconds"] | settings.powerKeyOffSeconds;
+    if (settings.powerKeyOffSeconds != 4 && settings.powerKeyOffSeconds != 6 &&
+        settings.powerKeyOffSeconds != 8 && settings.powerKeyOffSeconds != 10) {
+      settings.powerKeyOffSeconds = 6;
+    }
+  }
+
+  return true;
+}
+
+static void settingsToJson(JsonDocument &doc) {
+  doc["hostname"] = settings.hostname;
+
+  JsonObject wifi = doc.createNestedObject("wifi");
+  wifi["ssid"] = settings.staSsid;
+  wifi["password"] = settings.staPassword;
+  wifi["dhcp"] = settings.staDhcp;
+  wifi["staticIp"] = ipToString(settings.staIp);
+  wifi["gateway"] = ipToString(settings.staGateway);
+  wifi["subnet"] = ipToString(settings.staSubnet);
+  wifi["dns1"] = ipToString(settings.staDns1);
+  wifi["dns2"] = ipToString(settings.staDns2);
+  wifi["connectTimeoutSec"] = settings.staConnectTimeoutSec;
+
+  JsonObject ap = doc.createNestedObject("ap");
+  ap["ssid"] = settings.apSsid;
+  ap["password"] = settings.apPassword;
+  ap["ip"] = ipToString(settings.apIp);
+  ap["subnet"] = ipToString(settings.apSubnet);
+  ap["channel"] = settings.apChannel;
+  ap["maxClients"] = settings.apMaxClients;
+
+  JsonObject standalone = doc.createNestedObject("standalone");
+  standalone["dhcpOption42"] = settings.dhcpOption42;
+  standalone["dnsNtpAliases"] = settings.dnsNtpAliases;
+  standalone["dnsWildcardCaptive"] = settings.dnsWildcardCaptive;
+  JsonArray hosts = standalone.createNestedArray("ntpHosts");
+  for (size_t i = 0; i < settings.ntpHostCount; ++i) {
+    hosts.add(settings.ntpHosts[i]);
+  }
+
+  JsonObject time = doc.createNestedObject("time");
+  time["autoLocalOffset"] = settings.autoLocalOffset;
+  time["manualOffsetMinutes"] = settings.manualOffsetMinutes;
+  time["observeDst"] = settings.observeDst;
+  time["posixTimezone"] = settings.posixTimezone;
+
+  JsonObject displaySettings = doc.createNestedObject("display");
+  displaySettings["autoCycle"] = settings.oledAutoCycle;
+  displaySettings["cycleSeconds"] = settings.oledCycleSeconds;
+  displaySettings["screensaverTimeoutSec"] = settings.oledScreensaverTimeoutSec;
+
+  JsonObject power = doc.createNestedObject("power");
+  power["chargeEnabled"] = settings.chargeEnabled;
+  power["chargeCurrentMa"] = settings.chargeCurrentMa;
+  power["chargeTargetMv"] = settings.chargeTargetMv;
+  power["vbusCurrentLimitMa"] = settings.vbusCurrentLimitMa;
+  power["warningVoltageMv"] = settings.warningVoltageMv;
+  power["cutoffVoltageMv"] = settings.cutoffVoltageMv;
+  power["sysPowerDownMv"] = settings.sysPowerDownMv;
+  power["powerKeyOffSeconds"] = settings.powerKeyOffSeconds;
+}
+
+static bool littleFsFileExists(const char *path);
+
+static bool loadSettingsFile(const char *path) {
+  if (!littleFsFileExists(path)) {
+    return false;
+  }
+  File file = LittleFS.open(path, "r");
+  if (!file) {
+    return false;
+  }
+
+  DynamicJsonDocument doc(12288);
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+  if (error) {
+    Serial.printf("Settings parse failed for %s: %s\n", path, error.c_str());
+    return false;
+  }
+  return applySettingsJson(doc);
+}
+
+static bool loadSettings() {
+  setHardDefaults();
+  if (loadSettingsFile("/settings.json")) {
+    Serial.println("Loaded /settings.json");
+    return true;
+  }
+  if (loadSettingsFile("/settings.default.json")) {
+    Serial.println("Loaded /settings.default.json");
+    return true;
+  }
+  Serial.println("Using compiled defaults");
+  return false;
+}
+
+static bool saveSettings() {
+  DynamicJsonDocument doc(12288);
+  settingsToJson(doc);
+  File file = LittleFS.open("/settings.json", "w");
+  if (!file) {
+    return false;
+  }
+  serializeJsonPretty(doc, file);
+  file.flush();
+  file.close();
+  return true;
+}
+
+static bool littleFsFileExists(const char *path) {
+  String target = path ? path : "";
+  if (target.startsWith("/")) {
+    target.remove(0, 1);
+  }
+  File root = LittleFS.open("/");
+  if (!root) {
+    return false;
+  }
+  File file = root.openNextFile();
+  while (file) {
+    String name = file.name();
+    if (name.startsWith("/")) {
+      name.remove(0, 1);
+    }
+    bool match = name == target;
+    file.close();
+    if (match) {
+      root.close();
+      return true;
+    }
+    file = root.openNextFile();
+  }
+  root.close();
+  return false;
+}
+
+static String macSuffix() {
+  uint64_t mac = ESP.getEfuseMac();
+  char buf[7];
+  snprintf(buf, sizeof(buf), "%02X%02X%02X",
+           static_cast<uint8_t>(mac >> 16),
+           static_cast<uint8_t>(mac >> 8),
+           static_cast<uint8_t>(mac));
+  return String(buf);
+}
+
+static String expandedApSsid() {
+  String ssid = settings.apSsid;
+  ssid.replace("{mac}", macSuffix());
+  if (ssid.length() == 0) {
+    ssid = "TBeam-NTP-" + macSuffix();
+  }
+  return ssid.substring(0, 32);
+}
+
+static String sanitizedHostname() {
+  String host = settings.hostname;
+  host.trim();
+  host.toLowerCase();
+  String clean;
+  for (size_t i = 0; i < host.length() && clean.length() < 31; ++i) {
+    char c = host.charAt(i);
+    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+      clean += c;
+    } else if (c == '_' || c == ' ' || c == '.') {
+      clean += '-';
+    }
+  }
+  clean.trim();
+  while (clean.startsWith("-")) {
+    clean.remove(0, 1);
+  }
+  while (clean.endsWith("-")) {
+    clean.remove(clean.length() - 1);
+  }
+  if (clean.length() == 0) {
+    clean = "tbeam-ntp";
+  }
+  return clean;
+}
+
+static int64_t daysFromCivil(int y, unsigned m, unsigned d) {
+  y -= m <= 2;
+  const int era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = static_cast<unsigned>(y - era * 400);
+  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097LL + static_cast<int>(doe) - 719468LL;
+}
+
+static time_t gpsToUnix(uint16_t year, uint8_t month, uint8_t day,
+                        uint8_t hour, uint8_t minute, uint8_t second) {
+  int64_t days = daysFromCivil(year, month, day);
+  return static_cast<time_t>(days * 86400LL + hour * 3600LL + minute * 60LL + second);
+}
+
+static void setSystemTime(uint64_t unixUsec) {
+  timeval tv;
+  tv.tv_sec = unixUsec / 1000000ULL;
+  tv.tv_usec = unixUsec % 1000000ULL;
+  settimeofday(&tv, nullptr);
+}
+
+static void setClockAnchor(time_t epoch, uint64_t anchorUsec, bool ppsDisciplined) {
+  if (epoch < 1700000000) {
+    return;
+  }
+  clockAnchorEpoch = epoch;
+  clockAnchorUsec = anchorUsec;
+  clockValid = true;
+  clockPpsDisciplined = ppsDisciplined;
+  lastClockSyncMs = millis();
+  setSystemTime(static_cast<uint64_t>(epoch) * 1000000ULL);
+}
+
+static bool getClockUnixUsec(uint64_t &unixUsec) {
+  if (!clockValid) {
+    return false;
+  }
+  uint64_t now = esp_timer_get_time();
+  uint64_t elapsed = now >= clockAnchorUsec ? now - clockAnchorUsec : 0;
+  unixUsec = static_cast<uint64_t>(clockAnchorEpoch) * 1000000ULL + elapsed;
+  return true;
+}
+
+static bool hasFreshGpsTime(uint32_t maxAgeMs = 10000) {
+  return clockValid && lastNmeaUpdateMs != 0 && (millis() - lastNmeaUpdateMs) <= maxAgeMs;
+}
+
+static String formatTm(const tm &out) {
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+           out.tm_year + 1900, out.tm_mon + 1, out.tm_mday,
+           out.tm_hour, out.tm_min, out.tm_sec);
+  return String(buf);
+}
+
+static String formatUtc(uint64_t unixUsec, int16_t offsetMinutes = 0) {
+  time_t seconds = static_cast<time_t>(unixUsec / 1000000ULL) + offsetMinutes * 60;
+  tm out;
+  gmtime_r(&seconds, &out);
+  return formatTm(out);
+}
+
+static bool applyPosixTimezone() {
+  if (!settings.observeDst || settings.posixTimezone[0] == '\0') {
+    return false;
+  }
+
+  String rule(settings.posixTimezone);
+  if (!posixTimezoneApplied || activePosixTimezone != rule) {
+    setenv("TZ", settings.posixTimezone, 1);
+    tzset();
+    activePosixTimezone = rule;
+    posixTimezoneApplied = true;
+  }
+  return true;
+}
+
+static int16_t offsetFromLocalTm(time_t utcSeconds, const tm &localTm) {
+  time_t localAsUtc = gpsToUnix(localTm.tm_year + 1900, localTm.tm_mon + 1, localTm.tm_mday,
+                                localTm.tm_hour, localTm.tm_min, localTm.tm_sec);
+  long diffMinutes = static_cast<long>((localAsUtc - utcSeconds) / 60);
+  return clampI16(diffMinutes, -14 * 60, 14 * 60);
+}
+
+static int16_t currentLocalOffsetMinutes(uint64_t unixUsec = 0) {
+  if (unixUsec != 0 && applyPosixTimezone()) {
+    time_t seconds = static_cast<time_t>(unixUsec / 1000000ULL);
+    tm localTm;
+    localtime_r(&seconds, &localTm);
+    return offsetFromLocalTm(seconds, localTm);
+  }
+
+  if (settings.autoLocalOffset && gps.location.isValid() && gps.location.age() < 30000) {
+    int offsetHours = static_cast<int>(round(gps.location.lng() / 15.0));
+    offsetHours = clampI16(offsetHours, -12, 14);
+    return offsetHours * 60;
+  }
+  return settings.manualOffsetMinutes;
+}
+
+static bool isLocalDstActive(uint64_t unixUsec) {
+  if (!applyPosixTimezone()) {
+    return false;
+  }
+  time_t seconds = static_cast<time_t>(unixUsec / 1000000ULL);
+  tm localTm;
+  localtime_r(&seconds, &localTm);
+  return localTm.tm_isdst > 0;
+}
+
+static String localTimezoneName(uint64_t unixUsec) {
+  if (!applyPosixTimezone()) {
+    return "";
+  }
+  time_t seconds = static_cast<time_t>(unixUsec / 1000000ULL);
+  tm localTm;
+  localtime_r(&seconds, &localTm);
+  char buf[16];
+  strftime(buf, sizeof(buf), "%Z", &localTm);
+  return String(buf);
+}
+
+static String formatLocal(uint64_t unixUsec) {
+  if (applyPosixTimezone()) {
+    time_t seconds = static_cast<time_t>(unixUsec / 1000000ULL);
+    tm localTm;
+    localtime_r(&seconds, &localTm);
+    return formatTm(localTm);
+  }
+  return formatUtc(unixUsec, currentLocalOffsetMinutes());
+}
+
+static String maidenhead(double lat, double lon) {
+  if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
+    return "";
+  }
+  lon += 180.0;
+  lat += 90.0;
+
+  int fieldLon = static_cast<int>(lon / 20.0);
+  int fieldLat = static_cast<int>(lat / 10.0);
+  lon -= fieldLon * 20.0;
+  lat -= fieldLat * 10.0;
+
+  int squareLon = static_cast<int>(lon / 2.0);
+  int squareLat = static_cast<int>(lat / 1.0);
+  lon -= squareLon * 2.0;
+  lat -= squareLat * 1.0;
+
+  int subsquareLon = static_cast<int>(lon / (2.0 / 24.0));
+  int subsquareLat = static_cast<int>(lat / (1.0 / 24.0));
+
+  char buf[7];
+  snprintf(buf, sizeof(buf), "%c%c%d%d%c%c",
+           'A' + fieldLon, 'A' + fieldLat, squareLon, squareLat,
+           'a' + subsquareLon, 'a' + subsquareLat);
+  return String(buf);
+}
+
+static void IRAM_ATTR onPps() {
+  uint64_t now = esp_timer_get_time();
+  portENTER_CRITICAL_ISR(&ppsMux);
+  isrPpsUsec = now;
+  isrPpsCount++;
+  ppsPending = true;
+  portEXIT_CRITICAL_ISR(&ppsMux);
+}
+
+static void IRAM_ATTR onPmuIrq() {
+  pmuIrqPending = true;
+}
+
+static void handlePps() {
+  bool pending = false;
+  uint64_t ppsUsec = 0;
+  portENTER_CRITICAL(&ppsMux);
+  if (ppsPending) {
+    pending = true;
+    ppsUsec = isrPpsUsec;
+    ppsPending = false;
+  }
+  portEXIT_CRITICAL(&ppsMux);
+
+  if (!pending) {
+    return;
+  }
+
+  lastPpsUsec = ppsUsec;
+  lastPpsMs = millis();
+
+  if (clockValid) {
+    uint64_t elapsed = ppsUsec >= clockAnchorUsec ? ppsUsec - clockAnchorUsec : 1000000ULL;
+    uint32_t wholeSeconds = max<uint32_t>(1, (elapsed + 500000ULL) / 1000000ULL);
+    setClockAnchor(clockAnchorEpoch + wholeSeconds, ppsUsec, true);
+  } else if (lastNmeaEpoch > 0 && millis() - lastNmeaUpdateMs < 2000) {
+    setClockAnchor(lastNmeaEpoch + 1, ppsUsec, true);
+  }
+}
+
+static void consumeGps() {
+  while (GPSSerial.available()) {
+    gps.encode(static_cast<char>(GPSSerial.read()));
+  }
+
+  if (gps.date.isValid() && gps.time.isValid() &&
+      (gps.time.isUpdated() || gps.date.isUpdated())) {
+    time_t epoch = gpsToUnix(gps.date.year(), gps.date.month(), gps.date.day(),
+                             gps.time.hour(), gps.time.minute(), gps.time.second());
+    lastNmeaEpoch = epoch;
+    lastNmeaUpdateMs = millis();
+
+    uint64_t nowUsec = esp_timer_get_time();
+    uint64_t timeUsec = nowUsec;
+    uint32_t centiseconds = gps.time.centisecond();
+    if (centiseconds <= 99) {
+      timeUsec -= static_cast<uint64_t>(centiseconds) * 10000ULL;
+    }
+
+    if (lastPpsUsec != 0 && millis() - lastPpsMs < 1200) {
+      setClockAnchor(epoch, lastPpsUsec, true);
+    } else {
+      setClockAnchor(epoch, timeUsec, false);
+    }
+  }
+}
+
+static uint8_t chargeCurrentOption(uint16_t ma) {
+  struct CurrentMap {
+    uint16_t ma;
+    uint8_t opt;
+  };
+  static const CurrentMap map[] = {
+      {100, XPOWERS_AXP192_CHG_CUR_100MA},
+      {190, XPOWERS_AXP192_CHG_CUR_190MA},
+      {280, XPOWERS_AXP192_CHG_CUR_280MA},
+      {360, XPOWERS_AXP192_CHG_CUR_360MA},
+      {450, XPOWERS_AXP192_CHG_CUR_450MA},
+      {550, XPOWERS_AXP192_CHG_CUR_550MA},
+      {630, XPOWERS_AXP192_CHG_CUR_630MA},
+      {700, XPOWERS_AXP192_CHG_CUR_700MA},
+  };
+  uint8_t selected = map[0].opt;
+  for (const CurrentMap &entry : map) {
+    if (ma >= entry.ma) {
+      selected = entry.opt;
+    }
+  }
+  return selected;
+}
+
+static uint8_t chargeVoltageOption(uint16_t mv) {
+  if (mv <= 4100) {
+    return XPOWERS_AXP192_CHG_VOL_4V1;
+  }
+  if (mv <= 4150) {
+    return XPOWERS_AXP192_CHG_VOL_4V15;
+  }
+  return XPOWERS_AXP192_CHG_VOL_4V2;
+}
+
+static uint8_t powerOffOption(uint8_t seconds) {
+  if (seconds <= 4) {
+    return XPOWERS_POWEROFF_4S;
+  }
+  if (seconds <= 6) {
+    return XPOWERS_POWEROFF_6S;
+  }
+  if (seconds <= 8) {
+    return XPOWERS_POWEROFF_8S;
+  }
+  return XPOWERS_POWEROFF_10S;
+}
+
+static void applyPowerSettings() {
+  if (!powerState.online) {
+    return;
+  }
+
+  uint16_t sysDown = settings.sysPowerDownMv;
+  sysDown = (sysDown / 100) * 100;
+  sysDown = clampU16(sysDown, 2600, 3300);
+
+  pmu.setSysPowerDownVoltage(sysDown);
+  pmu.setVbusVoltageLimit(XPOWERS_AXP192_VBUS_VOL_LIM_4V5);
+  if (settings.vbusCurrentLimitMa == 100) {
+    pmu.setVbusCurrentLimit(XPOWERS_AXP192_VBUS_CUR_LIM_100MA);
+  } else if (settings.vbusCurrentLimitMa == 0) {
+    pmu.setVbusCurrentLimit(XPOWERS_AXP192_VBUS_CUR_LIM_OFF);
+  } else {
+    pmu.setVbusCurrentLimit(XPOWERS_AXP192_VBUS_CUR_LIM_500MA);
+  }
+
+  pmu.setChargerConstantCurr(chargeCurrentOption(settings.chargeCurrentMa));
+  pmu.setChargeTargetVoltage(chargeVoltageOption(settings.chargeTargetMv));
+  pmu.setChargerTerminationCurr(XPOWERS_AXP192_CHG_ITERM_LESS_10_PERCENT);
+
+  if (settings.chargeEnabled) {
+    pmu.enableCharge();
+  } else {
+    pmu.disableCharge();
+  }
+
+  pmu.setPowerKeyPressOffTime(powerOffOption(settings.powerKeyOffSeconds));
+  pmu.setPowerKeyPressOnTime(XPOWERS_POWERON_128MS);
+}
+
+static void beginPower() {
+  powerState.online = pmu.begin(Wire, AXP192_SLAVE_ADDRESS, PIN_I2C_SDA, PIN_I2C_SCL);
+  if (!powerState.online) {
+    Serial.println("AXP192 PMU not detected; continuing without battery telemetry");
+    return;
+  }
+
+  Serial.printf("AXP192 PMU online, chip ID 0x%02X\n", pmu.getChipID());
+  pmu.setChargingLedMode(XPOWERS_CHG_LED_CTRL_CHG);
+  pmu.disableTSPinMeasure();
+
+  pmu.setProtectedChannel(XPOWERS_DCDC3);
+  pmu.setProtectedChannel(XPOWERS_DCDC1);
+
+  pmu.setDC1Voltage(3300);
+  pmu.enableDC1();
+
+  pmu.setLDO3Voltage(3300);
+  pmu.enableLDO3();
+
+  pmu.setLDO2Voltage(3300);
+  pmu.disableLDO2();
+  pmu.disableDC2();
+
+  pmu.enableBattDetection();
+  pmu.enableVbusVoltageMeasure();
+  pmu.enableBattVoltageMeasure();
+  pmu.enableSystemVoltageMeasure();
+
+  pmu.disableIRQ(XPOWERS_AXP192_ALL_IRQ);
+  pmu.clearIrqStatus();
+  pmu.enableIRQ(XPOWERS_AXP192_VBUS_REMOVE_IRQ |
+                XPOWERS_AXP192_VBUS_INSERT_IRQ |
+                XPOWERS_AXP192_BAT_CHG_DONE_IRQ |
+                XPOWERS_AXP192_BAT_CHG_START_IRQ |
+                XPOWERS_AXP192_BAT_REMOVE_IRQ |
+                XPOWERS_AXP192_BAT_INSERT_IRQ |
+                XPOWERS_AXP192_PKEY_SHORT_IRQ |
+                XPOWERS_AXP192_PKEY_LONG_IRQ);
+
+  pinMode(PIN_PMU_IRQ, INPUT);
+  attachInterrupt(PIN_PMU_IRQ, onPmuIrq, FALLING);
+  applyPowerSettings();
+}
+
+static void pollPower() {
+  if (!powerState.online || millis() - lastPowerPollMs < 1000) {
+    return;
+  }
+  lastPowerPollMs = millis();
+
+  powerState.batteryPresent = pmu.isBatteryConnect();
+  powerState.charging = powerState.batteryPresent && pmu.isCharging();
+  powerState.discharging = powerState.batteryPresent && pmu.isDischarge();
+  powerState.vbusPresent = pmu.isVbusIn();
+  powerState.batteryMv = pmu.getBattVoltage();
+  powerState.vbusMv = pmu.getVbusVoltage();
+  powerState.vbusCurrentMa = pmu.getVbusCurrent();
+  powerState.systemMv = pmu.getSystemVoltage();
+  powerState.temperatureC = pmu.getTemperature();
+  powerState.batteryPercent = powerState.batteryPresent ? pmu.getBatteryPercent() : -1;
+
+  if (powerState.charging) {
+    powerState.batteryCurrentMa = pmu.getBatteryChargeCurrent();
+  } else if (powerState.discharging) {
+    powerState.batteryCurrentMa = -pmu.getBattDischargeCurrent();
+  } else {
+    powerState.batteryCurrentMa = 0.0f;
+  }
+
+  powerState.warning = powerState.batteryPresent && powerState.discharging &&
+                       powerState.batteryMv > 0 && powerState.batteryMv <= settings.warningVoltageMv;
+  bool belowCutoff = powerState.batteryPresent && powerState.discharging &&
+                     powerState.batteryMv > 0 && powerState.batteryMv <= settings.cutoffVoltageMv;
+  if (belowCutoff) {
+    if (lowBatterySinceMs == 0) {
+      lowBatterySinceMs = millis();
+    }
+    powerState.cutoffPending = true;
+    if (millis() - lowBatterySinceMs > 30000) {
+      Serial.println("Battery below cutoff while discharging; requesting PMU shutdown");
+      pmu.shutdown();
+    }
+  } else {
+    lowBatterySinceMs = 0;
+    powerState.cutoffPending = false;
+  }
+}
+
+static void handlePmuIrq() {
+  if (!powerState.online || !pmuIrqPending) {
+    return;
+  }
+  pmuIrqPending = false;
+  pmu.getIrqStatus();
+  if (pmu.isPekeyShortPressIrq()) {
+    oledPage = (oledPage + 1) % OLED_PAGE_COUNT;
+    lastOledCycleMs = millis();
+    lastOledActivityMs = millis();
+  }
+  pmu.clearIrqStatus();
+}
+
+static void scanI2c() {
+  if (millis() - lastI2cScanMs < 300000 && i2cDevices.length() > 0) {
+    return;
+  }
+  lastI2cScanMs = millis();
+  String out;
+  for (uint8_t addr = 1; addr < 127; ++addr) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      char buf[8];
+      snprintf(buf, sizeof(buf), "0x%02X", addr);
+      if (out.length() > 0) {
+        out += ", ";
+      }
+      out += buf;
+    }
+  }
+  i2cDevices = out.length() ? out : "none";
+}
+
+static bool hostMatchesNtpList(String host) {
+  host = normalizeHost(host);
+  for (size_t i = 0; i < settings.ntpHostCount; ++i) {
+    if (host == settings.ntpHosts[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool isCaptiveProbeHost(const String &host) {
+  static const char *probes[] = {
+      "captive.apple.com", "www.apple.com", "connectivitycheck.gstatic.com",
+      "clients3.google.com", "www.google.com", "www.msftconnecttest.com",
+      "msftconnecttest.com", "dns.msftncsi.com", "detectportal.firefox.com",
+      "network-test.debian.org"};
+  String normalized = normalizeHost(host);
+  for (const char *probe : probes) {
+    if (normalized == probe) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool shouldAnswerDns(String host, bool &aliasHit) {
+  host = normalizeHost(host);
+  aliasHit = false;
+  if (host.length() == 0) {
+    return false;
+  }
+  if (host == sanitizedHostname() || host == sanitizedHostname() + ".local") {
+    return true;
+  }
+  if (settings.dnsNtpAliases && hostMatchesNtpList(host)) {
+    aliasHit = true;
+    return true;
+  }
+  if (settings.dnsWildcardCaptive || isCaptiveProbeHost(host)) {
+    return true;
+  }
+  return false;
+}
+
+static bool readDnsName(const uint8_t *packet, size_t len, size_t &offset, String &name) {
+  name = "";
+  while (offset < len) {
+    uint8_t labelLen = packet[offset++];
+    if (labelLen == 0) {
+      return true;
+    }
+    if ((labelLen & 0xC0) != 0 || labelLen > 63 || offset + labelLen > len) {
+      return false;
+    }
+    if (name.length() > 0) {
+      name += ".";
+    }
+    for (uint8_t i = 0; i < labelLen; ++i) {
+      name += static_cast<char>(packet[offset++]);
+    }
+  }
+  return false;
+}
+
+static void processDns() {
+  if (!dnsOnline) {
+    return;
+  }
+  for (uint8_t handled = 0; handled < 4; ++handled) {
+    int packetSize = dnsUdp.parsePacket();
+    if (packetSize <= 0) {
+      return;
+    }
+
+    uint8_t packet[512];
+    int len = dnsUdp.read(packet, sizeof(packet));
+    if (len < 12) {
+      continue;
+    }
+    dnsQueryCount++;
+
+    size_t offset = 12;
+    String qname;
+    bool validName = readDnsName(packet, len, offset, qname);
+    if (!validName || offset + 4 > static_cast<size_t>(len)) {
+      continue;
+    }
+    uint16_t qtype = (packet[offset] << 8) | packet[offset + 1];
+    uint16_t qclass = (packet[offset + 2] << 8) | packet[offset + 3];
+    offset += 4;
+    size_t questionEnd = offset;
+
+    bool aliasHit = false;
+    bool answer = qtype == 1 && qclass == 1 && shouldAnswerDns(qname, aliasHit);
+    if (aliasHit) {
+      dnsAliasHitCount++;
+    }
+
+    uint8_t response[576];
+    memset(response, 0, sizeof(response));
+    memcpy(response, packet, questionEnd);
+    response[2] = 0x81;
+    response[3] = answer ? 0x80 : 0x83;
+    response[4] = 0x00;
+    response[5] = 0x01;
+    response[6] = 0x00;
+    response[7] = answer ? 0x01 : 0x00;
+    response[8] = response[9] = response[10] = response[11] = 0x00;
+
+    size_t responseLen = questionEnd;
+    if (answer && responseLen + 16 <= sizeof(response)) {
+      response[responseLen++] = 0xC0;
+      response[responseLen++] = 0x0C;
+      response[responseLen++] = 0x00;
+      response[responseLen++] = 0x01;
+      response[responseLen++] = 0x00;
+      response[responseLen++] = 0x01;
+      response[responseLen++] = 0x00;
+      response[responseLen++] = 0x00;
+      response[responseLen++] = 0x00;
+      response[responseLen++] = 0x3C;
+      response[responseLen++] = 0x00;
+      response[responseLen++] = 0x04;
+      response[responseLen++] = settings.apIp[0];
+      response[responseLen++] = settings.apIp[1];
+      response[responseLen++] = settings.apIp[2];
+      response[responseLen++] = settings.apIp[3];
+    }
+
+    dnsUdp.beginPacket(dnsUdp.remoteIP(), dnsUdp.remotePort());
+    dnsUdp.write(response, responseLen);
+    dnsUdp.endPacket();
+  }
+}
+
+static void encodeNtpTimestamp(uint8_t *out, uint64_t unixUsec) {
+  uint64_t seconds = unixUsec / 1000000ULL + UNIX_TO_NTP_SECONDS;
+  uint64_t fraction = ((unixUsec % 1000000ULL) << 32) / 1000000ULL;
+  uint32_t sec32 = static_cast<uint32_t>(seconds);
+  uint32_t frac32 = static_cast<uint32_t>(fraction);
+  out[0] = sec32 >> 24;
+  out[1] = sec32 >> 16;
+  out[2] = sec32 >> 8;
+  out[3] = sec32;
+  out[4] = frac32 >> 24;
+  out[5] = frac32 >> 16;
+  out[6] = frac32 >> 8;
+  out[7] = frac32;
+}
+
+static void processNtp() {
+  if (!ntpOnline) {
+    return;
+  }
+  for (uint8_t handled = 0; handled < 8; ++handled) {
+    int packetSize = ntpUdp.parsePacket();
+    if (packetSize <= 0) {
+      return;
+    }
+
+    uint8_t request[48];
+    memset(request, 0, sizeof(request));
+    int len = ntpUdp.read(request, sizeof(request));
+    while (ntpUdp.available()) {
+      ntpUdp.read();
+    }
+    if (len < 48) {
+      continue;
+    }
+
+    ntpRequestCount++;
+    uint64_t nowUsec = 0;
+    bool synced = getClockUnixUsec(nowUsec);
+    bool healthy = synced && hasFreshGpsTime();
+    if (!healthy) {
+      ntpSuppressedCount++;
+      continue;
+    }
+
+    uint8_t response[48];
+    memset(response, 0, sizeof(response));
+    response[0] = (0 << 6) | (4 << 3) | 4;
+    response[1] = 1;
+    response[2] = request[2] ? request[2] : 6;
+    response[3] = 0xEC;
+    response[8] = 0x00;
+    response[9] = 0x00;
+    response[10] = 0x00;
+    response[11] = 0x10;
+    response[12] = 'G';
+    response[13] = 'P';
+    response[14] = 'S';
+    response[15] = 0x00;
+    memcpy(response + 24, request + 40, 8);
+
+    uint64_t refUsec = static_cast<uint64_t>(clockAnchorEpoch) * 1000000ULL;
+    encodeNtpTimestamp(response + 16, refUsec);
+    encodeNtpTimestamp(response + 32, nowUsec);
+    encodeNtpTimestamp(response + 40, nowUsec);
+
+    ntpUdp.beginPacket(ntpUdp.remoteIP(), ntpUdp.remotePort());
+    ntpUdp.write(response, sizeof(response));
+    ntpUdp.endPacket();
+  }
+}
+
+static void configureDhcpOptions() {
+  ip_addr_t dnsServer;
+  IP_ADDR4(&dnsServer, settings.apIp[0], settings.apIp[1], settings.apIp[2], settings.apIp[3]);
+  dhcps_dns_setserver(&dnsServer);
+  dhcps_offer_t dnsOffer = OFFER_DNS;
+  dhcps_set_option_info(OFFER_DNS, &dnsOffer, sizeof(dnsOffer));
+
+  if (settings.dhcpOption42) {
+    ip4_addr_t ntpServer;
+    IP4_ADDR(&ntpServer, settings.apIp[0], settings.apIp[1], settings.apIp[2], settings.apIp[3]);
+    dhcps_set_option_info(NETWORK_TIME_PROTOCOL_SERVERS, &ntpServer, sizeof(ntpServer));
+    Serial.println("DHCP option 42 enabled for SoftAP clients");
+  } else {
+    Serial.println("DHCP option 42 disabled");
+  }
+}
+
+static void startDnsIfNeeded() {
+  if (dnsOnline) {
+    dnsUdp.stop();
+    dnsOnline = false;
+  }
+  if (networkMode == NetworkMode::ApFallback &&
+      (settings.dnsNtpAliases || settings.dnsWildcardCaptive)) {
+    dnsOnline = dnsUdp.begin(DNS_PORT);
+    Serial.printf("DNS server %s on %s\n", dnsOnline ? "started" : "failed", ipToString(settings.apIp).c_str());
+  }
+}
+
+static void startMdns() {
+  if (mdnsOnline) {
+    MDNS.end();
+    mdnsOnline = false;
+  }
+  String host = sanitizedHostname();
+  if (MDNS.begin(host.c_str())) {
+    MDNS.addService("ntp", "udp", NTP_PORT);
+    MDNS.addService("http", "tcp", 80);
+    mdnsOnline = true;
+  }
+}
+
+static void startNtp() {
+  if (!ntpOnline) {
+    ntpOnline = ntpUdp.begin(NTP_PORT);
+    Serial.printf("NTP server %s on UDP/%u\n", ntpOnline ? "started" : "failed", NTP_PORT);
+  }
+}
+
+static void startApMode() {
+  networkMode = NetworkMode::ApFallback;
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.disconnect(false, false);
+  WiFi.setSleep(false);
+
+  IPAddress leaseStart = settings.apIp;
+  leaseStart[3] = min<uint8_t>(settings.apIp[3] + 1, 250);
+  WiFi.softAPConfig(settings.apIp, settings.apIp, settings.apSubnet, leaseStart);
+
+  String ssid = expandedApSsid();
+  String password = settings.apPassword;
+  const char *pass = password.length() >= 8 ? password.c_str() : nullptr;
+  bool ok = WiFi.softAP(ssid.c_str(), pass, settings.apChannel, 0, settings.apMaxClients);
+  WiFi.softAPsetHostname(sanitizedHostname().c_str());
+
+  Serial.printf("AP mode %s: SSID=%s IP=%s maxClients=%u\n",
+                ok ? "started" : "failed", ssid.c_str(),
+                WiFi.softAPIP().toString().c_str(), settings.apMaxClients);
+  configureDhcpOptions();
+  startDnsIfNeeded();
+  startMdns();
+}
+
+static bool startStaMode() {
+  if (strlen(settings.staSsid) == 0) {
+    return false;
+  }
+
+  networkMode = NetworkMode::Sta;
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setHostname(sanitizedHostname().c_str());
+
+  if (settings.staDhcp) {
+    WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
+  } else {
+    WiFi.config(settings.staIp, settings.staGateway, settings.staSubnet, settings.staDns1, settings.staDns2);
+  }
+
+  Serial.printf("Connecting to WiFi SSID '%s'\n", settings.staSsid);
+  WiFi.begin(settings.staSsid, settings.staPassword);
+  uint32_t deadline = millis() + settings.staConnectTimeoutSec * 1000UL;
+  while (millis() < deadline && WiFi.status() != WL_CONNECTED) {
+    consumeGps();
+    handlePps();
+    delay(100);
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("STA connection failed; falling back to AP mode");
+    WiFi.disconnect(false, false);
+    return false;
+  }
+
+  if (dnsOnline) {
+    dnsUdp.stop();
+    dnsOnline = false;
+  }
+  Serial.printf("STA connected: IP=%s hostname=%s\n",
+                WiFi.localIP().toString().c_str(), sanitizedHostname().c_str());
+  startMdns();
+  return true;
+}
+
+static String gpsDopString() {
+  TinyGPSCustom *fields[] = {&pdopGn, &pdopGp, &hdopGn, &hdopGp, &vdopGn, &vdopGp};
+  for (TinyGPSCustom *field : fields) {
+    if (field->isValid()) {
+      return String(field->value());
+    }
+  }
+  if (gps.hdop.isValid()) {
+    return String(gps.hdop.hdop(), 1);
+  }
+  return "";
+}
+
+static const char INDEX_HTML[] PROGMEM = R"HTML(
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>T-Beam NTP</title>
+<style>
+:root{color-scheme:light;--bg:#f6f7f9;--ink:#17202a;--muted:#5d6875;--line:#d8dde5;--panel:#fff;--accent:#0f766e;--accent2:#1d4ed8;--warn:#b45309;--bad:#b91c1c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.35 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+header{background:#101820;color:#fff;padding:18px 20px}header h1{font-size:20px;margin:0 0 4px}header .meta{color:#b8c2cc}
+main{max-width:1120px;margin:0 auto;padding:18px;display:grid;gap:14px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}
+h2{font-size:15px;margin:0 0 12px}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:10px 12px}.span3{grid-column:span 3}.span4{grid-column:span 4}.span6{grid-column:span 6}.span8{grid-column:span 8}.span12{grid-column:span 12}
+label{display:block;font-weight:650;margin-bottom:4px}input,select,textarea,button{width:100%;font:inherit;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);padding:9px 10px}textarea{min-height:160px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+input[type=checkbox]{width:auto;margin-right:8px}.check{display:flex;align-items:center;min-height:39px;color:var(--ink);font-weight:650}.actions{display:flex;gap:10px;flex-wrap:wrap}.actions button{width:auto;min-width:120px}
+button{background:#e8eef6;cursor:pointer;font-weight:700}button.primary{background:var(--accent);border-color:var(--accent);color:#fff}button.secondary{background:#eaf0ff;border-color:#c6d4ff;color:#173b87}button.danger{background:#fff0f0;border-color:#ffc7c7;color:var(--bad)}
+.status{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.metric{border:1px solid var(--line);border-radius:8px;padding:10px;background:#fbfcfd}.metric b{display:block;font-size:12px;color:var(--muted);margin-bottom:3px}.metric span{font-size:15px}
+.ok{color:var(--accent)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted{color:var(--muted);font-size:12px}.hidden{display:none}
+@media(max-width:820px){.grid{grid-template-columns:1fr}.span3,.span4,.span6,.span8,.span12{grid-column:span 1}.status{grid-template-columns:1fr 1fr}.actions button{width:100%}}
+</style>
+</head>
+<body>
+<header><h1>T-Beam NTP</h1><div class="meta" id="topline">Loading</div></header>
+<main>
+<section><h2>Status</h2><div class="status" id="status"></div></section>
+<section><h2>Network</h2><div class="grid">
+<div class="span6"><label for="staSsid">Home SSID</label><input id="staSsid" list="scanList"></div>
+<div class="span3"><label>&nbsp;</label><button class="secondary" id="scanBtn">Scan</button></div>
+<div class="span3"><label for="staPass">Home password</label><input id="staPass" type="password"></div>
+<datalist id="scanList"></datalist>
+<div class="span4"><label for="hostname">Hostname</label><input id="hostname"></div>
+<div class="span4 check"><input id="staDhcp" type="checkbox">Use DHCP</div>
+<div class="span4"><label for="connectTimeout">Connect timeout seconds</label><input id="connectTimeout" type="number" min="5" max="90"></div>
+<div class="span3"><label for="staticIp">Static IP</label><input id="staticIp"></div>
+<div class="span3"><label for="gateway">Gateway</label><input id="gateway"></div>
+<div class="span3"><label for="subnet">Subnet</label><input id="subnet"></div>
+<div class="span3"><label for="dns1">DNS 1</label><input id="dns1"></div>
+</div></section>
+<section><h2>Standalone AP</h2><div class="grid">
+<div class="span4"><label for="apSsid">AP SSID</label><input id="apSsid"></div>
+<div class="span4"><label for="apPass">AP password</label><input id="apPass" type="password"></div>
+<div class="span2"><label for="apChannel">Channel</label><input id="apChannel" type="number" min="1" max="13"></div>
+<div class="span2"><label for="apMax">Max clients</label><input id="apMax" type="number" min="1" max="10"></div>
+<div class="span3"><label for="apIp">AP IP</label><input id="apIp"></div>
+<div class="span3"><label for="apSubnet">AP subnet</label><input id="apSubnet"></div>
+<div class="span3 check"><input id="opt42" type="checkbox">DHCP option 42</div>
+<div class="span3 check"><input id="dnsAliases" type="checkbox">DNS NTP aliases</div>
+<div class="span3 check"><input id="dnsWildcard" type="checkbox">Captive DNS wildcard</div>
+<div class="span12"><label for="ntpHosts">NTP host aliases</label><textarea id="ntpHosts" spellcheck="false"></textarea></div>
+</div></section>
+<section><h2>Time, Display, And Power</h2><div class="grid">
+<div class="span3 check"><input id="observeDst" type="checkbox">Use POSIX TZ/DST</div>
+<div class="span6"><label for="posixTimezone">POSIX TZ rule</label><input id="posixTimezone" maxlength="95"></div>
+<div class="span3 check"><input id="autoOffset" type="checkbox">Auto fallback offset</div>
+<div class="span3"><label for="manualOffset">Manual offset minutes</label><input id="manualOffset" type="number" min="-840" max="840"></div>
+<div class="span3 check"><input id="chargeEnabled" type="checkbox">Charging enabled</div>
+<div class="span3"><label for="chargeCurrent">Charge current mA</label><select id="chargeCurrent"><option>100</option><option>190</option><option selected>280</option><option>360</option><option>450</option><option>550</option><option>630</option><option>700</option></select></div>
+<div class="span3"><label for="chargeVoltage">Charge target mV</label><select id="chargeVoltage"><option>4100</option><option>4150</option><option>4200</option></select></div>
+<div class="span3"><label for="vbusLimit">VBUS limit mA</label><select id="vbusLimit"><option value="100">100</option><option value="500">500</option><option value="0">Off</option></select></div>
+<div class="span3"><label for="warnVoltage">Warning mV</label><input id="warnVoltage" type="number" min="3200" max="3900" step="10"></div>
+<div class="span3"><label for="cutoffVoltage">Cutoff mV</label><input id="cutoffVoltage" type="number" min="3000" max="3600" step="10"></div>
+<div class="span3"><label for="sysDown">PMU power-down mV</label><input id="sysDown" type="number" min="2600" max="3300" step="100"></div>
+<div class="span3"><label for="powerKey">Power key off seconds</label><select id="powerKey"><option>4</option><option>6</option><option>8</option><option>10</option></select></div>
+<div class="span3 check"><input id="oledCycle" type="checkbox">Cycle OLED screens</div>
+<div class="span3"><label for="oledCycleSeconds">OLED cycle seconds</label><input id="oledCycleSeconds" type="number" min="2" max="60"></div>
+<div class="span3"><label for="screenTimeout">Screensaver seconds</label><input id="screenTimeout" type="number" min="0" max="3600"></div>
+</div></section>
+<section><div class="actions"><button class="primary" id="saveBtn">Save</button><button class="danger" id="rebootBtn">Reboot</button><span class="muted" id="message"></span></div></section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let current={};
+function metric(k,v,c=''){return `<div class="metric"><b>${k}</b><span class="${c}">${v??''}</span></div>`}
+function offsetLabel(m){const s=m>=0?'+':'-';const a=Math.abs(m||0);return `UTC${s}${String(Math.floor(a/60)).padStart(2,'0')}:${String(a%60).padStart(2,'0')}`}
+async function getJson(url,opts){const r=await fetch(url,opts);if(!r.ok)throw new Error(await r.text());return r.json()}
+function setMsg(t,c=''){const el=$('message');el.textContent=t;el.className='muted '+c}
+function fillSettings(s){
+current=s;const d=s.display||{},t=s.time||{};
+$('hostname').value=s.hostname||'';$('staSsid').value=s.wifi.ssid||'';$('staPass').value=s.wifi.password||'';$('staDhcp').checked=!!s.wifi.dhcp;$('staticIp').value=s.wifi.staticIp;$('gateway').value=s.wifi.gateway;$('subnet').value=s.wifi.subnet;$('dns1').value=s.wifi.dns1;$('connectTimeout').value=s.wifi.connectTimeoutSec;$('apSsid').value=s.ap.ssid;$('apPass').value=s.ap.password;$('apIp').value=s.ap.ip;$('apSubnet').value=s.ap.subnet;$('apChannel').value=s.ap.channel;$('apMax').value=s.ap.maxClients;$('opt42').checked=!!s.standalone.dhcpOption42;$('dnsAliases').checked=!!s.standalone.dnsNtpAliases;$('dnsWildcard').checked=!!s.standalone.dnsWildcardCaptive;$('ntpHosts').value=(s.standalone.ntpHosts||[]).join('\n');$('observeDst').checked=t.observeDst!==false;$('posixTimezone').value=t.posixTimezone||'PST8PDT,M3.2.0/2,M11.1.0/2';$('autoOffset').checked=!!t.autoLocalOffset;$('manualOffset').value=t.manualOffsetMinutes??0;$('chargeEnabled').checked=!!s.power.chargeEnabled;$('chargeCurrent').value=s.power.chargeCurrentMa;$('chargeVoltage').value=s.power.chargeTargetMv;$('vbusLimit').value=s.power.vbusCurrentLimitMa;$('warnVoltage').value=s.power.warningVoltageMv;$('cutoffVoltage').value=s.power.cutoffVoltageMv;$('sysDown').value=s.power.sysPowerDownMv;$('powerKey').value=s.power.powerKeyOffSeconds;$('oledCycle').checked=d.autoCycle!==false;$('oledCycleSeconds').value=d.cycleSeconds||5;$('screenTimeout').value=d.screensaverTimeoutSec??300}
+function readSettings(){return{hostname:$('hostname').value,wifi:{ssid:$('staSsid').value,password:$('staPass').value,dhcp:$('staDhcp').checked,staticIp:$('staticIp').value,gateway:$('gateway').value,subnet:$('subnet').value,dns1:$('dns1').value,dns2:(current.wifi&&current.wifi.dns2)||'1.1.1.1',connectTimeoutSec:+$('connectTimeout').value},ap:{ssid:$('apSsid').value,password:$('apPass').value,ip:$('apIp').value,subnet:$('apSubnet').value,channel:+$('apChannel').value,maxClients:+$('apMax').value},standalone:{dhcpOption42:$('opt42').checked,dnsNtpAliases:$('dnsAliases').checked,dnsWildcardCaptive:$('dnsWildcard').checked,ntpHosts:$('ntpHosts').value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean)},time:{observeDst:$('observeDst').checked,posixTimezone:$('posixTimezone').value.trim(),autoLocalOffset:$('autoOffset').checked,manualOffsetMinutes:+$('manualOffset').value},display:{autoCycle:$('oledCycle').checked,cycleSeconds:+$('oledCycleSeconds').value,screensaverTimeoutSec:+$('screenTimeout').value},power:{chargeEnabled:$('chargeEnabled').checked,chargeCurrentMa:+$('chargeCurrent').value,chargeTargetMv:+$('chargeVoltage').value,vbusCurrentLimitMa:+$('vbusLimit').value,warningVoltageMv:+$('warnVoltage').value,cutoffVoltageMv:+$('cutoffVoltage').value,sysPowerDownMv:+$('sysDown').value,powerKeyOffSeconds:+$('powerKey').value}}}
+async function refreshStatus(){try{const s=await getJson('/api/status');$('topline').textContent=`${s.mode} ${s.ip} | UTC ${s.utc||'not synced'} | Local ${s.local||'not synced'} | clients ${s.clients}`;let gps=s.gps.fix?'ok':(s.gps.seen?'warn':'bad');let pwr=s.power.online?(s.power.warning?'warn':'ok'):'warn';let tz=s.timeZone?`${s.timeZone} ${s.dstActive?'DST':'STD'}`:offsetLabel(s.localOffsetMinutes);$('status').innerHTML=metric('Mode',s.mode)+metric('IP',s.ip)+metric('UTC',s.utc||'not synced',s.clock.synced?'ok':'bad')+metric('Local',s.local||'not synced',s.clock.synced?'ok':'bad')+metric('TZ',tz)+metric('PPS',s.clock.pps?'locked':'waiting',s.clock.pps?'ok':'warn')+metric('GPS',`${s.gps.sats} sats ${s.gps.grid||''}`,gps)+metric('Location',s.gps.fix?`${s.gps.lat.toFixed(6)}, ${s.gps.lon.toFixed(6)}`:'no fix')+metric('Altitude',s.gps.fix?`${s.gps.alt.toFixed(1)} m`:'')+metric('DOP',s.gps.dop||'')+metric('Battery',s.power.online?(s.power.batteryPresent?`${s.power.batteryMv} mV ${s.power.batteryCurrentMa.toFixed(0)} mA`:'no battery'):'PMU offline',pwr)+metric('VBUS',s.power.online?`${s.power.vbusMv} mV ${s.power.vbusCurrentMa.toFixed(0)} mA`:'')+metric('NTP/DNS',`${s.ntpRequests}/${s.ntpSuppressed} / ${s.dnsQueries}`)+metric('Heap',`${s.heap.free} free, PSRAM ${s.heap.psramFree}`)}catch(e){setMsg(e.message,'bad')}}
+async function load(){fillSettings(await getJson('/api/settings'));refreshStatus();setInterval(refreshStatus,2000)}
+$('saveBtn').onclick=async()=>{try{setMsg('Saving');await getJson('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(readSettings())});setMsg('Saved. Reboot to apply network changes.','ok')}catch(e){setMsg(e.message,'bad')}};
+$('rebootBtn').onclick=async()=>{if(confirm('Reboot now?')){await fetch('/api/reboot',{method:'POST'});setMsg('Rebooting')}};
+$('scanBtn').onclick=async()=>{try{setMsg('Scanning');const s=await getJson('/api/scan');const list=$('scanList');list.innerHTML='';s.networks.forEach(n=>{const o=document.createElement('option');o.value=n.ssid;o.label=`${n.rssi} dBm ch ${n.channel}`;list.appendChild(o)});setMsg(`Found ${s.networks.length} networks`)}catch(e){setMsg(e.message,'bad')}};
+load();
+</script>
+</body>
+</html>
+)HTML";
+
+static void sendJson(JsonDocument &doc) {
+  String output;
+  serializeJson(doc, output);
+  server.send(200, "application/json", output);
+}
+
+static void handleRoot() {
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+static void handleSettingsGet() {
+  DynamicJsonDocument doc(12288);
+  settingsToJson(doc);
+  sendJson(doc);
+}
+
+static void handleSettingsSave() {
+  if (!server.hasArg("plain")) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing body\"}");
+    return;
+  }
+  DynamicJsonDocument doc(12288);
+  DeserializationError error = deserializeJson(doc, server.arg("plain"));
+  if (error) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid json\"}");
+    return;
+  }
+  applySettingsJson(doc);
+  applyPowerSettings();
+  if (!saveSettings()) {
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"save failed\"}");
+    return;
+  }
+  server.send(200, "application/json", "{\"ok\":true,\"rebootRecommended\":true}");
+}
+
+static void handleScan() {
+  int count = WiFi.scanNetworks(false, true);
+  DynamicJsonDocument doc(4096);
+  JsonArray networks = doc.createNestedArray("networks");
+  for (int i = 0; i < count && i < 40; ++i) {
+    JsonObject n = networks.createNestedObject();
+    n["ssid"] = WiFi.SSID(i);
+    n["rssi"] = WiFi.RSSI(i);
+    n["channel"] = WiFi.channel(i);
+    n["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+  }
+  WiFi.scanDelete();
+  sendJson(doc);
+}
+
+static void handleReboot() {
+  server.send(200, "application/json", "{\"ok\":true}");
+  delay(250);
+  ESP.restart();
+}
+
+static void handleStatus() {
+  uint64_t nowUsec = 0;
+  bool synced = getClockUnixUsec(nowUsec);
+  bool servingTime = synced && hasFreshGpsTime();
+  int16_t localOffset = servingTime ? currentLocalOffsetMinutes(nowUsec) : currentLocalOffsetMinutes();
+  bool gpsFix = gps.location.isValid() && gps.location.age() < 10000 && gps.satellites.isValid() && gps.satellites.value() > 0;
+
+  DynamicJsonDocument doc(8192);
+  doc["mode"] = networkMode == NetworkMode::Sta ? "STA" : "AP";
+  doc["ip"] = networkMode == NetworkMode::Sta ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+  doc["hostname"] = sanitizedHostname();
+  doc["clients"] = networkMode == NetworkMode::ApFallback ? WiFi.softAPgetStationNum() : 0;
+  doc["utc"] = servingTime ? formatUtc(nowUsec) : "";
+  doc["local"] = servingTime ? formatLocal(nowUsec) : "";
+  doc["localOffsetMinutes"] = localOffset;
+  doc["timeZone"] = servingTime ? localTimezoneName(nowUsec) : "";
+  doc["dstActive"] = servingTime && isLocalDstActive(nowUsec);
+  doc["ntpRequests"] = ntpRequestCount;
+  doc["ntpSuppressed"] = ntpSuppressedCount;
+  doc["dnsQueries"] = dnsQueryCount;
+  doc["dnsAliasHits"] = dnsAliasHitCount;
+
+  JsonObject clock = doc.createNestedObject("clock");
+  clock["synced"] = servingTime;
+  clock["hasClock"] = synced;
+  clock["pps"] = clockPpsDisciplined && millis() - lastPpsMs < 2500;
+  clock["lastSyncMs"] = lastClockSyncMs;
+  clock["lastGpsTimeAgeMs"] = lastNmeaUpdateMs ? millis() - lastNmeaUpdateMs : -1;
+  clock["lastPpsAgeMs"] = lastPpsMs ? millis() - lastPpsMs : -1;
+
+  JsonObject gpsJson = doc.createNestedObject("gps");
+  gpsJson["seen"] = gps.charsProcessed() > 0;
+  gpsJson["fix"] = gpsFix;
+  gpsJson["sats"] = gps.satellites.isValid() ? gps.satellites.value() : 0;
+  gpsJson["lat"] = gps.location.isValid() ? gps.location.lat() : 0.0;
+  gpsJson["lon"] = gps.location.isValid() ? gps.location.lng() : 0.0;
+  gpsJson["alt"] = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
+  gpsJson["dop"] = gpsDopString();
+  gpsJson["grid"] = gps.location.isValid() ? maidenhead(gps.location.lat(), gps.location.lng()) : "";
+  gpsJson["chars"] = gps.charsProcessed();
+  gpsJson["sentences"] = gps.sentencesWithFix();
+
+  JsonObject power = doc.createNestedObject("power");
+  power["online"] = powerState.online;
+  power["batteryPresent"] = powerState.batteryPresent;
+  power["charging"] = powerState.charging;
+  power["discharging"] = powerState.discharging;
+  power["vbusPresent"] = powerState.vbusPresent;
+  power["batteryMv"] = powerState.batteryMv;
+  power["batteryCurrentMa"] = powerState.batteryCurrentMa;
+  power["batteryPercent"] = powerState.batteryPercent;
+  power["vbusMv"] = powerState.vbusMv;
+  power["vbusCurrentMa"] = powerState.vbusCurrentMa;
+  power["systemMv"] = powerState.systemMv;
+  power["temperatureC"] = powerState.temperatureC;
+  power["warning"] = powerState.warning;
+  power["cutoffPending"] = powerState.cutoffPending;
+
+  JsonObject heap = doc.createNestedObject("heap");
+  heap["free"] = ESP.getFreeHeap();
+  heap["minFree"] = ESP.getMinFreeHeap();
+  heap["psramSize"] = ESP.getPsramSize();
+  heap["psramFree"] = ESP.getFreePsram();
+
+  doc["i2c"] = i2cDevices;
+  JsonObject displaySettings = doc.createNestedObject("display");
+  displaySettings["page"] = oledPage;
+  displaySettings["sleeping"] = oledSleeping;
+  sendJson(doc);
+}
+
+static void handleNotFound() {
+  if (networkMode == NetworkMode::ApFallback) {
+    server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
+    server.send(302, "text/plain", "");
+  } else {
+    server.send(404, "text/plain", "Not found");
+  }
+}
+
+static void beginWeb() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/settings", HTTP_GET, handleSettingsGet);
+  server.on("/api/save", HTTP_POST, handleSettingsSave);
+  server.on("/api/scan", HTTP_GET, handleScan);
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/reboot", HTTP_POST, handleReboot);
+  server.on("/generate_204", HTTP_GET, handleRoot);
+  server.on("/hotspot-detect.html", HTTP_GET, handleRoot);
+  server.on("/connecttest.txt", HTTP_GET, handleRoot);
+  server.on("/ncsi.txt", HTTP_GET, handleRoot);
+  server.onNotFound(handleNotFound);
+  server.begin();
+}
+
+static void drawLine(int y, const String &text) {
+  display.drawString(0, y, text.substring(0, 22));
+}
+
+static void drawCentered(int y, const String &text, const uint8_t *font) {
+  display.setFont(font);
+  int x = max(0, (128 - display.getStringWidth(text)) / 2);
+  display.drawString(x, y, text);
+}
+
+static void wakeOled() {
+  if (!oledOnline) {
+    return;
+  }
+  if (oledSleeping) {
+    display.displayOn();
+    oledSleeping = false;
+  }
+  lastOledActivityMs = millis();
+  lastOledUpdateMs = 0;
+}
+
+static void sleepOled() {
+  if (!oledOnline || oledSleeping) {
+    return;
+  }
+  display.clear();
+  display.display();
+  display.displayOff();
+  oledSleeping = true;
+}
+
+static void factoryResetSettings(const char *reason) {
+  Serial.printf("Factory reset requested: %s\n", reason ? reason : "user button");
+  if (littleFsFileExists("/settings.json")) {
+    LittleFS.remove("/settings.json");
+  }
+  delay(250);
+  ESP.restart();
+}
+
+static void checkBootFactoryReset() {
+  if (digitalRead(PIN_USER_BUTTON) != LOW) {
+    return;
+  }
+  Serial.println("User button held at boot; hold for 10 seconds to factory reset");
+  uint32_t start = millis();
+  while (millis() - start < USER_BUTTON_FACTORY_RESET_MS) {
+    if (digitalRead(PIN_USER_BUTTON) != LOW) {
+      Serial.println("Factory reset canceled");
+      return;
+    }
+    delay(50);
+  }
+  factoryResetSettings("boot button hold");
+}
+
+static void updateOled() {
+  if (!oledOnline) {
+    return;
+  }
+
+  uint64_t nowUsec = 0;
+  bool synced = getClockUnixUsec(nowUsec);
+  bool servingTime = synced && hasFreshGpsTime();
+  bool gpsFix = gps.location.isValid() && gps.location.age() < 10000;
+
+  if (gpsFix != lastDisplayGpsFix) {
+    lastDisplayGpsFix = gpsFix;
+    wakeOled();
+  }
+
+  if (lastOledActivityMs == 0) {
+    lastOledActivityMs = millis();
+  }
+
+  if (!oledSleeping && settings.oledScreensaverTimeoutSec > 0 &&
+      millis() - lastOledActivityMs >= static_cast<uint32_t>(settings.oledScreensaverTimeoutSec) * 1000UL) {
+    sleepOled();
+    return;
+  }
+
+  if (oledSleeping) {
+    return;
+  }
+
+  if (settings.oledAutoCycle && settings.oledCycleSeconds > 0 &&
+      millis() - lastOledCycleMs >= static_cast<uint32_t>(settings.oledCycleSeconds) * 1000UL) {
+    oledPage = (oledPage + 1) % OLED_PAGE_COUNT;
+    lastOledCycleMs = millis();
+    lastOledUpdateMs = 0;
+  }
+
+  if (millis() - lastOledUpdateMs < 1000) {
+    return;
+  }
+  lastOledUpdateMs = millis();
+
+  display.clear();
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.setFont(ArialMT_Plain_10);
+
+  if (oledPage == 0) {
+    drawLine(0, networkMode == NetworkMode::Sta ? "WiFi STA " + WiFi.localIP().toString() : "AP " + WiFi.softAPIP().toString());
+    drawLine(12, servingTime ? "UTC " + formatUtc(nowUsec).substring(11) : "NTP gated: no GPS");
+    drawLine(24, servingTime ? "LOC " + formatLocal(nowUsec).substring(11) : "LOC not synced");
+    drawLine(36, String("GPS ") + (gpsFix ? "fix" : "no fix") + " PPS " + ((clockPpsDisciplined && millis() - lastPpsMs < 2500) ? "lock" : "wait"));
+    drawLine(48, String("NTP ") + ntpRequestCount + "/" + ntpSuppressedCount + " DNS " + dnsQueryCount);
+  } else if (oledPage == 1) {
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.setFont(ArialMT_Plain_10);
+    drawLine(0, "UTC");
+    if (servingTime) {
+      drawCentered(17, formatUtc(nowUsec).substring(11), ArialMT_Plain_24);
+      display.setFont(ArialMT_Plain_10);
+      drawCentered(48, formatUtc(nowUsec).substring(0, 10), ArialMT_Plain_10);
+    } else {
+      drawCentered(20, "NO GPS", ArialMT_Plain_24);
+      drawCentered(48, "TIME", ArialMT_Plain_10);
+    }
+  } else if (oledPage == 2) {
+    String grid = gps.location.isValid() ? maidenhead(gps.location.lat(), gps.location.lng()) : "";
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.setFont(ArialMT_Plain_10);
+    drawLine(0, "Maidenhead");
+    drawCentered(17, grid.length() ? grid : "--", ArialMT_Plain_24);
+    display.setFont(ArialMT_Plain_10);
+    drawCentered(48, gpsFix ? "GPS fix" : "waiting for fix", ArialMT_Plain_10);
+  } else if (oledPage == 3) {
+    drawLine(0, String("Sat ") + (gps.satellites.isValid() ? gps.satellites.value() : 0) + " DOP " + gpsDopString());
+    drawLine(12, gps.location.isValid() ? String(gps.location.lat(), 5) : "lat --");
+    drawLine(24, gps.location.isValid() ? String(gps.location.lng(), 5) : "lon --");
+    drawLine(36, gps.altitude.isValid() ? "Alt " + String(gps.altitude.meters(), 1) + " m" : "Alt --");
+    drawLine(48, gps.location.isValid() ? "Grid " + maidenhead(gps.location.lat(), gps.location.lng()) : "Grid --");
+  } else if (oledPage == 4) {
+    drawLine(0, networkMode == NetworkMode::Sta ? "Network client" : "Standalone AP");
+    drawLine(12, networkMode == NetworkMode::Sta ? WiFi.SSID() : expandedApSsid());
+    drawLine(24, networkMode == NetworkMode::Sta ? WiFi.localIP().toString() : WiFi.softAPIP().toString());
+    drawLine(36, String("Clients ") + (networkMode == NetworkMode::ApFallback ? WiFi.softAPgetStationNum() : 0) + "/" + settings.apMaxClients);
+    drawLine(48, String("Opt42 ") + (settings.dhcpOption42 ? "on" : "off") + " DNS " + (dnsOnline ? "on" : "off"));
+  } else {
+    drawLine(0, powerState.online ? "AXP192 online" : "PMU offline");
+    drawLine(12, powerState.batteryPresent ? String("Bat ") + powerState.batteryMv + " mV" : "No battery");
+    drawLine(24, String("I ") + powerState.batteryCurrentMa + " mA");
+    drawLine(36, powerState.vbusPresent ? String("USB ") + powerState.vbusMv + " mV" : "USB absent");
+    drawLine(48, powerState.warning ? "Battery warning" : String("Temp ") + powerState.temperatureC + " C");
+  }
+
+  display.display();
+}
+
+static void handleUserButton() {
+  static bool lastRawState = true;
+  static bool stableState = true;
+  static uint32_t lastEdgeMs = 0;
+  static uint32_t pressedAtMs = 0;
+  static bool longPressHandled = false;
+  static bool pressWokeDisplay = false;
+
+  bool rawState = digitalRead(PIN_USER_BUTTON);
+  if (rawState != lastRawState) {
+    lastRawState = rawState;
+    lastEdgeMs = millis();
+  }
+  if (millis() - lastEdgeMs < 60) {
+    return;
+  }
+
+  if (rawState != stableState) {
+    stableState = rawState;
+    if (stableState == LOW) {
+      pressedAtMs = millis();
+      longPressHandled = false;
+      pressWokeDisplay = oledSleeping;
+      wakeOled();
+    } else {
+      uint32_t pressDuration = pressedAtMs ? millis() - pressedAtMs : 0;
+      if (!longPressHandled && !pressWokeDisplay && pressDuration < USER_BUTTON_FACTORY_RESET_MS) {
+        oledPage = (oledPage + 1) % OLED_PAGE_COUNT;
+        lastOledCycleMs = millis();
+        lastOledUpdateMs = 0;
+      }
+      pressedAtMs = 0;
+    }
+  }
+
+  if (stableState == LOW && pressedAtMs != 0 && !longPressHandled &&
+      millis() - pressedAtMs >= USER_BUTTON_FACTORY_RESET_MS) {
+    longPressHandled = true;
+    factoryResetSettings("runtime button hold");
+  }
+}
+
+static void checkStaHealth() {
+  if (networkMode != NetworkMode::Sta) {
+    return;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    staLostSinceMs = 0;
+    return;
+  }
+  if (staLostSinceMs == 0) {
+    staLostSinceMs = millis();
+  }
+  if (millis() - staLostSinceMs > 60000) {
+    Serial.println("STA lost for 60 seconds; falling back to AP mode");
+    startApMode();
+  }
+}
+
+void setup() {
+  Serial.begin(SERIAL_BAUD);
+  delay(200);
+  Serial.println();
+  Serial.println("T-Beam GPS disciplined NTP server booting");
+
+#if CONFIG_BT_ENABLED
+  esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+#endif
+
+  WiFi.persistent(false);
+  pinMode(PIN_USER_BUTTON, INPUT);
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS mount failed");
+  }
+  checkBootFactoryReset();
+  loadSettings();
+
+  beginPower();
+  delay(100);
+  oledOnline = display.init();
+  if (oledOnline) {
+    display.flipScreenVertically();
+    display.clear();
+    display.setFont(ArialMT_Plain_10);
+    display.drawString(0, 0, "T-Beam NTP boot");
+    display.display();
+    lastOledActivityMs = millis();
+    lastOledCycleMs = millis();
+  }
+
+  pinMode(PIN_GPS_PPS, INPUT);
+  attachInterrupt(PIN_GPS_PPS, onPps, RISING);
+  GPSSerial.begin(GPS_BAUD, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+
+  scanI2c();
+  if (!startStaMode()) {
+    startApMode();
+  }
+  startNtp();
+  beginWeb();
+  Serial.println("HTTP portal started");
+}
+
+void loop() {
+  consumeGps();
+  handlePps();
+  handlePmuIrq();
+  pollPower();
+  scanI2c();
+  handleUserButton();
+  server.handleClient();
+  processDns();
+  processNtp();
+  updateOled();
+  checkStaHealth();
+  delay(1);
+}

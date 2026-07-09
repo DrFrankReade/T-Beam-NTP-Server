@@ -1,0 +1,90 @@
+{
+  "hostname": "tbeam-ntp",
+  "wifi": {
+    "ssid": "",
+    "password": "",
+    "dhcp": true,
+    "staticIp": "192.168.1.50",
+    "gateway": "192.168.1.1",
+    "subnet": "255.255.255.0",
+    "dns1": "192.168.1.1",
+    "dns2": "1.1.1.1",
+    "connectTimeoutSec": 25
+  },
+  "ap": {
+    "ssid": "TBeam-NTP-{mac}",
+    "password": "",
+    "ip": "192.168.4.1",
+    "subnet": "255.255.255.0",
+    "channel": 6,
+    "maxClients": 8
+  },
+  "standalone": {
+    "dhcpOption42": true,
+    "dnsNtpAliases": true,
+    "dnsWildcardCaptive": true,
+    "ntpHosts": [
+      "time.cloudflare.com",
+      "time.google.com",
+      "time1.google.com",
+      "time2.google.com",
+      "time3.google.com",
+      "time4.google.com",
+      "time.android.com",
+      "time.apple.com",
+      "time-ios.apple.com",
+      "time.windows.com",
+      "pool.ntp.org",
+      "0.pool.ntp.org",
+      "1.pool.ntp.org",
+      "2.pool.ntp.org",
+      "3.pool.ntp.org",
+      "us.pool.ntp.org",
+      "0.us.pool.ntp.org",
+      "1.us.pool.ntp.org",
+      "2.us.pool.ntp.org",
+      "3.us.pool.ntp.org",
+      "north-america.pool.ntp.org",
+      "time.nist.gov",
+      "time-a-g.nist.gov",
+      "time-b-g.nist.gov",
+      "time-c-g.nist.gov",
+      "time-d-g.nist.gov",
+      "time-a-wwv.nist.gov",
+      "time-b-wwv.nist.gov",
+      "time-a-b.nist.gov",
+      "time-b-b.nist.gov",
+      "ntp.ubuntu.com",
+      "time.aws.com",
+      "time.facebook.com",
+      "time1.facebook.com",
+      "time2.facebook.com",
+      "time3.facebook.com",
+      "time4.facebook.com",
+      "clock.isc.org",
+      "ntp.org",
+      "nist.time.gov"
+    ]
+  },
+  "time": {
+    "autoLocalOffset": true,
+    "manualOffsetMinutes": 0,
+    "observeDst": true,
+    "posixTimezone": "PST8PDT,M3.2.0/2,M11.1.0/2"
+  },
+  "display": {
+    "autoCycle": true,
+    "cycleSeconds": 5,
+    "screensaverTimeoutSec": 300
+  },
+  "power": {
+    "chargeEnabled": true,
+    "chargeCurrentMa": 280,
+    "chargeTargetMv": 4100,
+    "vbusCurrentLimitMa": 500,
+    "warningVoltageMv": 3500,
+    "cutoffVoltageMv": 3200,
+    "sysPowerDownMv": 3000,
+    "powerKeyOffSeconds": 6
+  }
+}
