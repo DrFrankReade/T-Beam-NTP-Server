@@ -41,9 +41,13 @@ static constexpr uint16_t DNS_PORT = 53;
 static constexpr size_t MAX_NTP_HOSTS = 64;
 static constexpr size_t POSIX_TZ_MAX_LEN = 96;
 static constexpr uint64_t UNIX_TO_NTP_SECONDS = 2208988800ULL;
-static constexpr uint8_t OLED_PAGE_COUNT = 6;
+static constexpr uint8_t OLED_PAGE_COUNT = 7;
 static constexpr uint32_t USER_BUTTON_FACTORY_RESET_MS = 10000;
+static constexpr uint32_t FACTORY_RESET_CONFIRM_WINDOW_MS = 30000;
+static constexpr uint32_t OLED_MANUAL_CYCLE_PAUSE_MS = 30000;
+static constexpr const char *FIRMWARE_VERSION = "v0.1.2";
 static constexpr const char *DEFAULT_POSIX_TZ = "PST8PDT,M3.2.0/2,M11.1.0/2";
+static constexpr const char *DEFAULT_AP_PASSWORD = "tbeam-ntp";
 
 enum class NetworkMode {
   ApFallback,
@@ -143,6 +147,7 @@ static uint32_t lastPowerPollMs = 0;
 static uint32_t lastOledUpdateMs = 0;
 static uint32_t lastOledCycleMs = 0;
 static uint32_t lastOledActivityMs = 0;
+static uint32_t oledAutoCyclePausedUntilMs = 0;
 static uint32_t lastI2cScanMs = 0;
 static String activePosixTimezone;
 static bool posixTimezoneApplied = false;
@@ -150,6 +155,11 @@ static String i2cDevices = "";
 static uint8_t oledPage = 0;
 static bool oledSleeping = false;
 static bool lastDisplayGpsFix = false;
+static uint32_t splashUntilMs = 0;
+static bool bootForceApMode = false;
+static bool factoryResetConfirmPending = false;
+static bool factoryResetConfirmHoldArmed = false;
+static uint32_t factoryResetConfirmUntilMs = 0;
 
 static portMUX_TYPE ppsMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool ppsPending = false;
@@ -166,6 +176,8 @@ static uint32_t lastPpsMs = 0;
 static uint32_t lastClockSyncMs = 0;
 static time_t lastNmeaEpoch = 0;
 static uint32_t lastNmeaUpdateMs = 0;
+
+static void wakeOled();
 
 static void copyText(char *dst, size_t len, const char *src) {
   if (len == 0) {
@@ -284,7 +296,7 @@ static void setHardDefaults() {
   settings.staConnectTimeoutSec = 25;
 
   copyText(settings.apSsid, sizeof(settings.apSsid), "TBeam-NTP-{mac}");
-  copyText(settings.apPassword, sizeof(settings.apPassword), "");
+  copyText(settings.apPassword, sizeof(settings.apPassword), DEFAULT_AP_PASSWORD);
   settings.apIp = IPAddress(192, 168, 4, 1);
   settings.apSubnet = IPAddress(255, 255, 255, 0);
   settings.apChannel = 6;
@@ -624,8 +636,19 @@ static bool getClockUnixUsec(uint64_t &unixUsec) {
   return true;
 }
 
+static bool hasFreshGpsFix(uint32_t maxAgeMs = 10000) {
+  return gps.location.isValid() && gps.location.age() <= maxAgeMs &&
+         gps.satellites.isValid() && gps.satellites.value() > 0;
+}
+
 static bool hasFreshGpsTime(uint32_t maxAgeMs = 10000) {
-  return clockValid && lastNmeaUpdateMs != 0 && (millis() - lastNmeaUpdateMs) <= maxAgeMs;
+  return clockValid && lastNmeaUpdateMs != 0 &&
+         (millis() - lastNmeaUpdateMs) <= maxAgeMs &&
+         hasFreshGpsFix(maxAgeMs);
+}
+
+static bool hasRecentPps(uint32_t maxAgeMs = 2500) {
+  return clockPpsDisciplined && lastPpsMs != 0 && (millis() - lastPpsMs) <= maxAgeMs;
 }
 
 static String formatTm(const tm &out) {
@@ -799,6 +822,8 @@ static void consumeGps() {
       timeUsec -= static_cast<uint64_t>(centiseconds) * 10000ULL;
     }
 
+    // NMEA gives the absolute UTC second; PPS gives the precise second edge.
+    // Pair a recent PPS edge with the NMEA epoch whenever the receiver provides both.
     if (lastPpsUsec != 0 && millis() - lastPpsMs < 1200) {
       setClockAnchor(epoch, lastPpsUsec, true);
     } else {
@@ -976,6 +1001,15 @@ static void pollPower() {
   }
 }
 
+static bool beforeDeadline(uint32_t deadlineMs) {
+  return deadlineMs != 0 && static_cast<int32_t>(millis() - deadlineMs) < 0;
+}
+
+static void pauseOledAutoCycle() {
+  oledAutoCyclePausedUntilMs = millis() + OLED_MANUAL_CYCLE_PAUSE_MS;
+  lastOledCycleMs = millis();
+}
+
 static void handlePmuIrq() {
   if (!powerState.online || !pmuIrqPending) {
     return;
@@ -983,9 +1017,14 @@ static void handlePmuIrq() {
   pmuIrqPending = false;
   pmu.getIrqStatus();
   if (pmu.isPekeyShortPressIrq()) {
-    oledPage = (oledPage + 1) % OLED_PAGE_COUNT;
-    lastOledCycleMs = millis();
+    bool wokeDisplay = oledSleeping;
+    wakeOled();
+    if (!wokeDisplay) {
+      oledPage = (oledPage + 1) % OLED_PAGE_COUNT;
+    }
+    pauseOledAutoCycle();
     lastOledActivityMs = millis();
+    lastOledUpdateMs = 0;
   }
   pmu.clearIrqStatus();
 }
@@ -1160,6 +1199,14 @@ static void encodeNtpTimestamp(uint8_t *out, uint64_t unixUsec) {
   out[7] = frac32;
 }
 
+static void encodeNtpShort(uint8_t *out, float seconds) {
+  uint32_t value = static_cast<uint32_t>(seconds * 65536.0f + 0.5f);
+  out[0] = value >> 24;
+  out[1] = value >> 16;
+  out[2] = value >> 8;
+  out[3] = value;
+}
+
 static void processNtp() {
   if (!ntpOnline) {
     return;
@@ -1181,8 +1228,10 @@ static void processNtp() {
     }
 
     ntpRequestCount++;
-    uint64_t nowUsec = 0;
-    bool synced = getClockUnixUsec(nowUsec);
+    uint64_t recvUsec = 0;
+    bool synced = getClockUnixUsec(recvUsec);
+    // Fail closed: PPS can maintain phase briefly, but fresh NMEA proves the GPS
+    // receiver is still reporting valid absolute UTC rather than stale holdover.
     bool healthy = synced && hasFreshGpsTime();
     if (!healthy) {
       ntpSuppressedCount++;
@@ -1191,24 +1240,29 @@ static void processNtp() {
 
     uint8_t response[48];
     memset(response, 0, sizeof(response));
-    response[0] = (0 << 6) | (4 << 3) | 4;
+    uint8_t version = (request[0] >> 3) & 0x07;
+    if (version < 3 || version > 4) {
+      version = 4;
+    }
+    bool ppsLocked = hasRecentPps();
+    response[0] = (0 << 6) | (version << 3) | 4;
     response[1] = 1;
     response[2] = request[2] ? request[2] : 6;
-    response[3] = 0xEC;
-    response[8] = 0x00;
-    response[9] = 0x00;
-    response[10] = 0x00;
-    response[11] = 0x10;
+    response[3] = ppsLocked ? static_cast<uint8_t>(-20) : static_cast<uint8_t>(-10);
+    encodeNtpShort(response + 4, 0.0f);
+    encodeNtpShort(response + 8, ppsLocked ? 0.001f : 0.250f);
     response[12] = 'G';
     response[13] = 'P';
     response[14] = 'S';
-    response[15] = 0x00;
+    response[15] = ppsLocked ? 0x00 : 'N';
     memcpy(response + 24, request + 40, 8);
 
     uint64_t refUsec = static_cast<uint64_t>(clockAnchorEpoch) * 1000000ULL;
+    uint64_t txUsec = recvUsec;
+    getClockUnixUsec(txUsec);
     encodeNtpTimestamp(response + 16, refUsec);
-    encodeNtpTimestamp(response + 32, nowUsec);
-    encodeNtpTimestamp(response + 40, nowUsec);
+    encodeNtpTimestamp(response + 32, recvUsec);
+    encodeNtpTimestamp(response + 40, txUsec);
 
     ntpUdp.beginPacket(ntpUdp.remoteIP(), ntpUdp.remotePort());
     ntpUdp.write(response, sizeof(response));
@@ -1355,7 +1409,9 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.35 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
 header{background:#101820;color:#fff;padding:18px 20px}header h1{font-size:20px;margin:0 0 4px}header .meta{color:#b8c2cc}
 main{max-width:1120px;margin:0 auto;padding:18px;display:grid;gap:14px}
-section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}
+section,details.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}
+details.panel>summary{cursor:pointer;font-weight:800;font-size:15px;margin:-2px 0 12px;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:12px}details.panel>summary::after{content:"\25BE";color:var(--muted);font-size:13px;line-height:1}details.panel[open]>summary::after{content:"\25B4"}details.panel>summary::-webkit-details-marker{display:none}details.panel:not([open])>summary{margin-bottom:0}
+.status-panel{background:#fff}.network-panel{background:#f6fbff}.ap-panel{background:#f5fffb}.time-panel{background:#fffaf2}.actions-panel{background:#f8f7ff}
 h2{font-size:15px;margin:0 0 12px}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:10px 12px}.span3{grid-column:span 3}.span4{grid-column:span 4}.span6{grid-column:span 6}.span8{grid-column:span 8}.span12{grid-column:span 12}
 label{display:block;font-weight:650;margin-bottom:4px}input,select,textarea,button{width:100%;font:inherit;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);padding:9px 10px}textarea{min-height:160px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
 input[type=checkbox]{width:auto;margin-right:8px}.check{display:flex;align-items:center;min-height:39px;color:var(--ink);font-weight:650}.actions{display:flex;gap:10px;flex-wrap:wrap}.actions button{width:auto;min-width:120px}
@@ -1368,8 +1424,8 @@ button{background:#e8eef6;cursor:pointer;font-weight:700}button.primary{backgrou
 <body>
 <header><h1 title="GPS/PPS disciplined NTP server status and configuration">T-Beam NTP</h1><div class="meta" id="topline">Loading</div></header>
 <main>
-<section><h2 title="Live clock, GPS, network, power, and memory state">Status</h2><div class="status" id="status"></div></section>
-<section><h2 title="Settings used when the T-Beam joins an existing WiFi network">Network</h2><div class="grid">
+<details class="panel status-panel" open><summary title="Live clock, GPS, network, power, and memory state">Status</summary><div class="status" id="status"></div></details>
+<details class="panel network-panel"><summary title="Settings used when the T-Beam joins an existing WiFi network">Network</summary><div class="grid">
 <div class="span6"><label for="staSsid">Home SSID</label><input id="staSsid" list="scanList" maxlength="32"></div>
 <div class="span3"><label>&nbsp;</label><button class="secondary" id="scanBtn">Scan</button></div>
 <div class="span3"><label for="staPass">Home password</label><input id="staPass" type="password" maxlength="64"></div>
@@ -1381,8 +1437,8 @@ button{background:#e8eef6;cursor:pointer;font-weight:700}button.primary{backgrou
 <div class="span3"><label for="gateway">Gateway</label><input id="gateway"></div>
 <div class="span3"><label for="subnet">Subnet</label><input id="subnet"></div>
 <div class="span3"><label for="dns1">DNS 1</label><input id="dns1"></div>
-</div></section>
-<section><h2 title="Settings used when the T-Beam is its own off-grid WiFi network">Standalone AP</h2><div class="grid">
+</div></details>
+<details class="panel ap-panel"><summary title="Settings used when the T-Beam is its own off-grid WiFi network">Standalone AP</summary><div class="grid">
 <div class="span4"><label for="apSsid">AP SSID</label><input id="apSsid" maxlength="32" aria-describedby="apSsidNote"><div class="hint" id="apSsidNote">Use {mac} to insert this unit's last six MAC hex digits.</div></div>
 <div class="span4"><label for="apPass">AP password</label><input id="apPass" type="password" maxlength="64"></div>
 <div class="span2"><label for="apChannel">Channel</label><input id="apChannel" type="number" min="1" max="13"></div>
@@ -1393,8 +1449,8 @@ button{background:#e8eef6;cursor:pointer;font-weight:700}button.primary{backgrou
 <div class="span3 check"><input id="dnsAliases" type="checkbox">DNS NTP aliases</div>
 <div class="span3 check"><input id="dnsWildcard" type="checkbox">Captive DNS wildcard</div>
 <div class="span12"><label for="ntpHosts">NTP host aliases</label><textarea id="ntpHosts" spellcheck="false"></textarea></div>
-</div></section>
-<section><h2 title="Local display time, OLED behavior, and AXP192 battery/USB power settings">Time, Display, And Power</h2><div class="grid">
+</div></details>
+<details class="panel time-panel"><summary title="Local display time, OLED behavior, and AXP192 battery/USB power settings">Time, Display, And Power</summary><div class="grid">
 <div class="span3 check"><input id="observeDst" type="checkbox">Use POSIX TZ/DST</div>
 <div class="span6"><label for="posixTimezone">POSIX TZ rule</label><input id="posixTimezone" maxlength="95"></div>
 <div class="span3 check"><input id="autoOffset" type="checkbox">Auto fallback offset</div>
@@ -1410,8 +1466,8 @@ button{background:#e8eef6;cursor:pointer;font-weight:700}button.primary{backgrou
 <div class="span3 check"><input id="oledCycle" type="checkbox">Cycle OLED screens</div>
 <div class="span3"><label for="oledCycleSeconds">OLED cycle seconds</label><input id="oledCycleSeconds" type="number" min="2" max="60"></div>
 <div class="span3"><label for="screenTimeout">Screensaver seconds</label><input id="screenTimeout" type="number" min="0" max="3600"></div>
-</div></section>
-<section><div class="actions"><button class="primary" id="saveBtn">Save</button><button class="danger" id="rebootBtn">Reboot</button><span class="muted" id="message"></span></div></section>
+</div></details>
+<details class="panel actions-panel" open><summary title="Save settings or restart the T-Beam">Actions</summary><div class="actions"><button class="primary" id="saveBtn">Save</button><button class="danger" id="rebootBtn">Reboot</button><span class="muted" id="message"></span></div></details>
 </main>
 <script>
 const $=id=>document.getElementById(id);
@@ -1432,7 +1488,7 @@ subnet:'Subnet mask for static LAN mode, normally 255.255.255.0 on small network
 dns1:'DNS server used by the T-Beam in LAN mode when static addressing is selected.',
 apSsid:'Standalone AP network name. The literal token {mac} is replaced with the last six MAC hex digits for this unit before the AP starts.',
 apSsidNote:'Shows the AP SSID after {mac} expansion, using the value reported by the firmware.',
-apPass:'Standalone AP password. Leave blank for an open field network, or use at least 8 characters for WPA.',
+apPass:'Standalone AP password. Default is tbeam-ntp. Leave blank for an open field network, or use at least 8 characters for WPA.',
 apChannel:'2.4 GHz WiFi channel for standalone AP mode. Use 1, 6, or 11 when avoiding overlap.',
 apMax:'Maximum SoftAP stations allowed. Higher values increase management and buffer pressure.',
 apIp:'IPv4 address of the T-Beam in standalone AP mode. DHCP, DNS, portal, and NTP use this address.',
@@ -1462,12 +1518,13 @@ message:'Save, scan, and reboot status messages appear here.'
 };
 const metricTips={
 Mode:'Current network mode: AP for standalone service or STA for LAN client mode.',
+Version:'Firmware version running on this T-Beam.',
 IP:'IPv4 address currently serving the portal and NTP.',
 UTC:'GPS-derived UTC time. NTP uses UTC and ignores local timezone settings.',
 Local:'Display-only local time after POSIX TZ/DST or fallback offset handling.',
 TZ:'Timezone abbreviation, daylight-saving state, or numeric fallback offset.',
 PPS:'Whether recent GPS PPS edges are disciplining the firmware clock.',
-GPS:'Fix quality summary with satellite count and Maidenhead grid when available.',
+GPS:'Fix quality summary with satellite count and grid square when available.',
 Location:'Current GPS latitude and longitude when a fix is fresh.',
 Altitude:'GPS altitude in meters when available.',
 DOP:'Dilution of precision reported by the GPS receiver.',
@@ -1486,7 +1543,7 @@ function fillSettings(s){
 current=s;const d=s.display||{},t=s.time||{};
 $('hostname').value=s.hostname||'';$('staSsid').value=s.wifi.ssid||'';$('staPass').value=s.wifi.password||'';$('staDhcp').checked=!!s.wifi.dhcp;$('staticIp').value=s.wifi.staticIp;$('gateway').value=s.wifi.gateway;$('subnet').value=s.wifi.subnet;$('dns1').value=s.wifi.dns1;$('connectTimeout').value=s.wifi.connectTimeoutSec;$('apSsid').value=s.ap.ssid;$('apPass').value=s.ap.password;$('apIp').value=s.ap.ip;$('apSubnet').value=s.ap.subnet;$('apChannel').value=s.ap.channel;$('apMax').value=s.ap.maxClients;$('opt42').checked=!!s.standalone.dhcpOption42;$('dnsAliases').checked=!!s.standalone.dnsNtpAliases;$('dnsWildcard').checked=!!s.standalone.dnsWildcardCaptive;$('ntpHosts').value=(s.standalone.ntpHosts||[]).join('\n');$('observeDst').checked=t.observeDst!==false;$('posixTimezone').value=t.posixTimezone||'PST8PDT,M3.2.0/2,M11.1.0/2';$('autoOffset').checked=!!t.autoLocalOffset;$('manualOffset').value=t.manualOffsetMinutes??0;$('chargeEnabled').checked=!!s.power.chargeEnabled;$('chargeCurrent').value=s.power.chargeCurrentMa;$('chargeVoltage').value=s.power.chargeTargetMv;$('vbusLimit').value=s.power.vbusCurrentLimitMa;$('warnVoltage').value=s.power.warningVoltageMv;$('cutoffVoltage').value=s.power.cutoffVoltageMv;$('sysDown').value=s.power.sysPowerDownMv;$('powerKey').value=s.power.powerKeyOffSeconds;$('oledCycle').checked=d.autoCycle!==false;$('oledCycleSeconds').value=d.cycleSeconds||5;$('screenTimeout').value=d.screensaverTimeoutSec??300;const ex=s.ap.expandedSsid||s.ap.ssid||'';$('apSsidNote').textContent=`Use {mac} to insert this unit's last six MAC hex digits. Current AP SSID: ${ex}.`}
 function readSettings(){return{hostname:$('hostname').value,wifi:{ssid:$('staSsid').value,password:$('staPass').value,dhcp:$('staDhcp').checked,staticIp:$('staticIp').value,gateway:$('gateway').value,subnet:$('subnet').value,dns1:$('dns1').value,dns2:(current.wifi&&current.wifi.dns2)||'1.1.1.1',connectTimeoutSec:+$('connectTimeout').value},ap:{ssid:$('apSsid').value,password:$('apPass').value,ip:$('apIp').value,subnet:$('apSubnet').value,channel:+$('apChannel').value,maxClients:+$('apMax').value},standalone:{dhcpOption42:$('opt42').checked,dnsNtpAliases:$('dnsAliases').checked,dnsWildcardCaptive:$('dnsWildcard').checked,ntpHosts:$('ntpHosts').value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean)},time:{observeDst:$('observeDst').checked,posixTimezone:$('posixTimezone').value.trim(),autoLocalOffset:$('autoOffset').checked,manualOffsetMinutes:+$('manualOffset').value},display:{autoCycle:$('oledCycle').checked,cycleSeconds:+$('oledCycleSeconds').value,screensaverTimeoutSec:+$('screenTimeout').value},power:{chargeEnabled:$('chargeEnabled').checked,chargeCurrentMa:+$('chargeCurrent').value,chargeTargetMv:+$('chargeVoltage').value,vbusCurrentLimitMa:+$('vbusLimit').value,warningVoltageMv:+$('warnVoltage').value,cutoffVoltageMv:+$('cutoffVoltage').value,sysPowerDownMv:+$('sysDown').value,powerKeyOffSeconds:+$('powerKey').value}}}
-async function refreshStatus(){try{const s=await getJson('/api/status');$('topline').textContent=`${s.mode} ${s.ip} | UTC ${s.utc||'not synced'} | Local ${s.local||'not synced'} | clients ${s.clients}`;let gps=s.gps.fix?'ok':(s.gps.seen?'warn':'bad');let pwr=s.power.online?(s.power.warning?'warn':'ok'):'warn';let tz=s.timeZone?`${s.timeZone} ${s.dstActive?'DST':'STD'}`:offsetLabel(s.localOffsetMinutes);$('status').innerHTML=metric('Mode',s.mode)+metric('IP',s.ip)+metric('UTC',s.utc||'not synced',s.clock.synced?'ok':'bad')+metric('Local',s.local||'not synced',s.clock.synced?'ok':'bad')+metric('TZ',tz)+metric('PPS',s.clock.pps?'locked':'waiting',s.clock.pps?'ok':'warn')+metric('GPS',`${s.gps.sats} sats ${s.gps.grid||''}`,gps)+metric('Location',s.gps.fix?`${s.gps.lat.toFixed(6)}, ${s.gps.lon.toFixed(6)}`:'no fix')+metric('Altitude',s.gps.fix?`${s.gps.alt.toFixed(1)} m`:'')+metric('DOP',s.gps.dop||'')+metric('Battery',s.power.online?(s.power.batteryPresent?`${s.power.batteryMv} mV ${s.power.batteryCurrentMa.toFixed(0)} mA`:'no battery'):'PMU offline',pwr)+metric('VBUS',s.power.online?`${s.power.vbusMv} mV ${s.power.vbusCurrentMa.toFixed(0)} mA`:'')+metric('NTP/DNS',`${s.ntpRequests}/${s.ntpSuppressed} / ${s.dnsQueries}`)+metric('Heap',`${s.heap.free} free, PSRAM ${s.heap.psramFree}`)}catch(e){setMsg(e.message,'bad')}}
+async function refreshStatus(){try{const s=await getJson('/api/status');$('topline').textContent=`${s.mode} ${s.ip} | UTC ${s.utc||'not synced'} | Local ${s.local||'not synced'} | clients ${s.clients}`;let gps=s.gps.fix?'ok':(s.gps.seen?'warn':'bad');let pwr=s.power.online?(s.power.warning?'warn':'ok'):'warn';let tz=s.timeZone?`${s.timeZone} ${s.dstActive?'DST':'STD'}`:offsetLabel(s.localOffsetMinutes);$('status').innerHTML=metric('Mode',s.mode)+metric('Version',s.version||'')+metric('IP',s.ip)+metric('UTC',s.utc||'not synced',s.clock.synced?'ok':'bad')+metric('Local',s.local||'not synced',s.clock.synced?'ok':'bad')+metric('TZ',tz)+metric('PPS',s.clock.pps?'locked':'waiting',s.clock.pps?'ok':'warn')+metric('GPS',`${s.gps.sats} sats ${s.gps.grid||''}`,gps)+metric('Location',s.gps.fix?`${s.gps.lat.toFixed(6)}, ${s.gps.lon.toFixed(6)}`:'no fix')+metric('Altitude',s.gps.fix?`${s.gps.alt.toFixed(1)} m`:'')+metric('DOP',s.gps.dop||'')+metric('Battery',s.power.online?(s.power.batteryPresent?`${s.power.batteryMv} mV ${s.power.batteryCurrentMa.toFixed(0)} mA`:'no battery'):'PMU offline',pwr)+metric('VBUS',s.power.online?`${s.power.vbusMv} mV ${s.power.vbusCurrentMa.toFixed(0)} mA`:'')+metric('NTP/DNS',`${s.ntpRequests}/${s.ntpSuppressed} / ${s.dnsQueries}`)+metric('Heap',`${s.heap.free} free, PSRAM ${s.heap.psramFree}`)}catch(e){setMsg(e.message,'bad')}}
 async function load(){applyTooltips();fillSettings(await getJson('/api/settings'));refreshStatus();setInterval(refreshStatus,2000)}
 $('saveBtn').onclick=async()=>{try{setMsg('Saving');await getJson('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(readSettings())});setMsg('Saved. Reboot to apply network changes.','ok')}catch(e){setMsg(e.message,'bad')}};
 $('rebootBtn').onclick=async()=>{if(confirm('Reboot now?')){await fetch('/api/reboot',{method:'POST'});setMsg('Rebooting')}};
@@ -1559,10 +1616,11 @@ static void handleStatus() {
   bool synced = getClockUnixUsec(nowUsec);
   bool servingTime = synced && hasFreshGpsTime();
   int16_t localOffset = servingTime ? currentLocalOffsetMinutes(nowUsec) : currentLocalOffsetMinutes();
-  bool gpsFix = gps.location.isValid() && gps.location.age() < 10000 && gps.satellites.isValid() && gps.satellites.value() > 0;
+  bool gpsFix = hasFreshGpsFix();
 
   DynamicJsonDocument doc(8192);
   doc["mode"] = networkMode == NetworkMode::Sta ? "STA" : "AP";
+  doc["version"] = FIRMWARE_VERSION;
   doc["ip"] = networkMode == NetworkMode::Sta ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
   doc["hostname"] = sanitizedHostname();
   doc["clients"] = networkMode == NetworkMode::ApFallback ? WiFi.softAPgetStationNum() : 0;
@@ -1579,20 +1637,20 @@ static void handleStatus() {
   JsonObject clock = doc.createNestedObject("clock");
   clock["synced"] = servingTime;
   clock["hasClock"] = synced;
-  clock["pps"] = clockPpsDisciplined && millis() - lastPpsMs < 2500;
+  clock["pps"] = hasRecentPps();
   clock["lastSyncMs"] = lastClockSyncMs;
-  clock["lastGpsTimeAgeMs"] = lastNmeaUpdateMs ? millis() - lastNmeaUpdateMs : -1;
-  clock["lastPpsAgeMs"] = lastPpsMs ? millis() - lastPpsMs : -1;
+  clock["lastGpsTimeAgeMs"] = lastNmeaUpdateMs ? static_cast<int32_t>(millis() - lastNmeaUpdateMs) : -1;
+  clock["lastPpsAgeMs"] = lastPpsMs ? static_cast<int32_t>(millis() - lastPpsMs) : -1;
 
   JsonObject gpsJson = doc.createNestedObject("gps");
   gpsJson["seen"] = gps.charsProcessed() > 0;
   gpsJson["fix"] = gpsFix;
   gpsJson["sats"] = gps.satellites.isValid() ? gps.satellites.value() : 0;
-  gpsJson["lat"] = gps.location.isValid() ? gps.location.lat() : 0.0;
-  gpsJson["lon"] = gps.location.isValid() ? gps.location.lng() : 0.0;
+  gpsJson["lat"] = gpsFix ? gps.location.lat() : 0.0;
+  gpsJson["lon"] = gpsFix ? gps.location.lng() : 0.0;
   gpsJson["alt"] = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
   gpsJson["dop"] = gpsDopString();
-  gpsJson["grid"] = gps.location.isValid() ? maidenhead(gps.location.lat(), gps.location.lng()) : "";
+  gpsJson["grid"] = gpsFix ? maidenhead(gps.location.lat(), gps.location.lng()) : "";
   gpsJson["chars"] = gps.charsProcessed();
   gpsJson["sentences"] = gps.sentencesWithFix();
 
@@ -1659,6 +1717,116 @@ static void drawCentered(int y, const String &text, const uint8_t *font) {
   display.drawString(x, y, text);
 }
 
+static void drawText(int y, const String &text, const uint8_t *font) {
+  display.setFont(font);
+  display.drawString(0, y, text);
+}
+
+static void drawTimePage(const String &title, const String &timestamp, bool servingTime) {
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.setFont(ArialMT_Plain_10);
+  drawLine(0, title);
+  if (servingTime) {
+    drawCentered(17, timestamp.substring(11), ArialMT_Plain_24);
+    display.setFont(ArialMT_Plain_10);
+    drawCentered(48, timestamp.substring(0, 10), ArialMT_Plain_10);
+  } else {
+    drawCentered(20, "NO GPS", ArialMT_Plain_24);
+    drawCentered(48, "TIME", ArialMT_Plain_10);
+  }
+}
+
+static String apPasswordForDisplay() {
+  if (strlen(settings.apPassword) == 0) {
+    return "(open)";
+  }
+  return String(settings.apPassword);
+}
+
+static bool oledTextExceedsWidth(const String &text, const uint8_t *font) {
+  display.setFont(font);
+  return display.getStringWidth(text) > 128;
+}
+
+static void drawScrollingText(int y, const String &text, const uint8_t *font) {
+  display.setFont(font);
+  int width = display.getStringWidth(text);
+  if (width <= 128) {
+    display.drawString(0, y, text);
+    return;
+  }
+
+  constexpr int gapPx = 28;
+  uint32_t span = static_cast<uint32_t>(width + gapPx);
+  int offset = static_cast<int>((millis() / 90UL) % span);
+  display.drawString(-offset, y, text);
+  display.drawString(width + gapPx - offset, y, text);
+}
+
+static bool networkPageHasScrollingText() {
+  if (oledPage != 5) {
+    return false;
+  }
+  String networkName = networkMode == NetworkMode::Sta ? WiFi.SSID() : expandedApSsid();
+  return oledTextExceedsWidth(networkName, ArialMT_Plain_10) ||
+         oledTextExceedsWidth("Pass " + apPasswordForDisplay(), ArialMT_Plain_10);
+}
+
+static void ensureOledAwakeForPrompt() {
+  if (!oledOnline) {
+    return;
+  }
+  if (oledSleeping) {
+    display.displayOn();
+    oledSleeping = false;
+  }
+  splashUntilMs = 0;
+  lastOledActivityMs = millis();
+  lastOledUpdateMs = millis();
+}
+
+static void showPromptScreen(const String &title, const String &line1, const String &line2) {
+  if (!oledOnline) {
+    return;
+  }
+  ensureOledAwakeForPrompt();
+  display.clear();
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  drawCentered(0, title, ArialMT_Plain_16);
+  drawCentered(25, line1, ArialMT_Plain_10);
+  drawCentered(39, line2, ArialMT_Plain_10);
+  display.display();
+}
+
+static void showBootSplash() {
+  if (!oledOnline) {
+    return;
+  }
+  display.clear();
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  drawCentered(0, "T-Beam", ArialMT_Plain_24);
+  drawCentered(28, "NTP Server", ArialMT_Plain_16);
+  drawCentered(51, FIRMWARE_VERSION, ArialMT_Plain_10);
+  display.display();
+  splashUntilMs = millis() + 2500UL;
+}
+
+static void showBootButtonPrompt() {
+  showPromptScreen("Button Held", "Hold 10s: reset", "Release: AP mode");
+}
+
+static void showBootForceApPrompt() {
+  showPromptScreen("AP Mode", "Forced for", "this boot");
+}
+
+static void showResetConfirmPrompt() {
+  showPromptScreen("Reset?", "Hold button", "10s again");
+}
+
+static void showFactoryResetPrompt() {
+  showPromptScreen("Resetting", "Settings cleared", "Restarting");
+}
+
 static void wakeOled() {
   if (!oledOnline) {
     return;
@@ -1683,6 +1851,7 @@ static void sleepOled() {
 
 static void factoryResetSettings(const char *reason) {
   Serial.printf("Factory reset requested: %s\n", reason ? reason : "user button");
+  showFactoryResetPrompt();
   if (littleFsFileExists("/settings.json")) {
     LittleFS.remove("/settings.json");
   }
@@ -1690,20 +1859,73 @@ static void factoryResetSettings(const char *reason) {
   ESP.restart();
 }
 
+static void requestFactoryResetConfirmation(const char *reason) {
+  Serial.printf("Factory reset confirmation requested: %s\n", reason ? reason : "user button");
+  factoryResetConfirmPending = true;
+  factoryResetConfirmUntilMs = millis() + FACTORY_RESET_CONFIRM_WINDOW_MS;
+  pauseOledAutoCycle();
+  wakeOled();
+  showResetConfirmPrompt();
+}
+
 static void checkBootFactoryReset() {
   if (digitalRead(PIN_USER_BUTTON) != LOW) {
     return;
   }
-  Serial.println("User button held at boot; hold for 10 seconds to factory reset");
+  Serial.println("User button held at boot; release before 10 seconds to force AP mode");
+  showBootButtonPrompt();
   uint32_t start = millis();
   while (millis() - start < USER_BUTTON_FACTORY_RESET_MS) {
     if (digitalRead(PIN_USER_BUTTON) != LOW) {
-      Serial.println("Factory reset canceled");
+      Serial.println("Boot button released before reset threshold; forcing AP mode for this boot");
+      bootForceApMode = true;
+      showBootForceApPrompt();
+      delay(900);
       return;
     }
     delay(50);
   }
-  factoryResetSettings("boot button hold");
+
+  Serial.println("Factory reset threshold reached; waiting for confirmation hold");
+  showResetConfirmPrompt();
+  uint32_t releaseDeadline = millis() + FACTORY_RESET_CONFIRM_WINDOW_MS;
+  while (digitalRead(PIN_USER_BUTTON) == LOW && beforeDeadline(releaseDeadline)) {
+    delay(50);
+  }
+  if (digitalRead(PIN_USER_BUTTON) == LOW) {
+    Serial.println("Reset confirmation canceled; button was not released");
+    bootForceApMode = true;
+    showBootForceApPrompt();
+    delay(900);
+    return;
+  }
+
+  factoryResetConfirmPending = true;
+  factoryResetConfirmUntilMs = millis() + FACTORY_RESET_CONFIRM_WINDOW_MS;
+  while (beforeDeadline(factoryResetConfirmUntilMs)) {
+    if (digitalRead(PIN_USER_BUTTON) == LOW) {
+      uint32_t confirmStart = millis();
+      while (digitalRead(PIN_USER_BUTTON) == LOW) {
+        if (millis() - confirmStart >= USER_BUTTON_FACTORY_RESET_MS) {
+          factoryResetSettings("boot confirmed button hold");
+        }
+        delay(50);
+      }
+      Serial.println("Reset confirmation press released early; forcing AP mode for this boot");
+      factoryResetConfirmPending = false;
+      bootForceApMode = true;
+      showBootForceApPrompt();
+      delay(900);
+      return;
+    }
+    delay(50);
+  }
+
+  Serial.println("Reset confirmation timed out; forcing AP mode for this boot");
+  factoryResetConfirmPending = false;
+  bootForceApMode = true;
+  showBootForceApPrompt();
+  delay(900);
 }
 
 static void updateOled() {
@@ -1711,10 +1933,23 @@ static void updateOled() {
     return;
   }
 
+  if (splashUntilMs != 0 && millis() < splashUntilMs) {
+    return;
+  }
+  splashUntilMs = 0;
+
+  if (factoryResetConfirmPending) {
+    if (beforeDeadline(factoryResetConfirmUntilMs) || factoryResetConfirmHoldArmed) {
+      return;
+    }
+    factoryResetConfirmPending = false;
+    lastOledUpdateMs = 0;
+  }
+
   uint64_t nowUsec = 0;
   bool synced = getClockUnixUsec(nowUsec);
   bool servingTime = synced && hasFreshGpsTime();
-  bool gpsFix = gps.location.isValid() && gps.location.age() < 10000;
+  bool gpsFix = hasFreshGpsFix();
 
   if (gpsFix != lastDisplayGpsFix) {
     lastDisplayGpsFix = gpsFix;
@@ -1736,13 +1971,15 @@ static void updateOled() {
   }
 
   if (settings.oledAutoCycle && settings.oledCycleSeconds > 0 &&
+      !beforeDeadline(oledAutoCyclePausedUntilMs) &&
       millis() - lastOledCycleMs >= static_cast<uint32_t>(settings.oledCycleSeconds) * 1000UL) {
     oledPage = (oledPage + 1) % OLED_PAGE_COUNT;
     lastOledCycleMs = millis();
     lastOledUpdateMs = 0;
   }
 
-  if (millis() - lastOledUpdateMs < 1000) {
+  uint32_t refreshMs = networkPageHasScrollingText() ? 250UL : 1000UL;
+  if (millis() - lastOledUpdateMs < refreshMs) {
     return;
   }
   lastOledUpdateMs = millis();
@@ -1755,46 +1992,36 @@ static void updateOled() {
     drawLine(0, networkMode == NetworkMode::Sta ? "WiFi STA " + WiFi.localIP().toString() : "AP " + WiFi.softAPIP().toString());
     drawLine(12, servingTime ? "UTC " + formatUtc(nowUsec).substring(11) : "NTP gated: no GPS");
     drawLine(24, servingTime ? "LOC " + formatLocal(nowUsec).substring(11) : "LOC not synced");
-    drawLine(36, String("GPS ") + (gpsFix ? "fix" : "no fix") + " PPS " + ((clockPpsDisciplined && millis() - lastPpsMs < 2500) ? "lock" : "wait"));
+    drawLine(36, String("GPS ") + (gpsFix ? "fix" : "no fix") + " PPS " + (hasRecentPps() ? "lock" : "wait"));
     drawLine(48, String("NTP ") + ntpRequestCount + "/" + ntpSuppressedCount + " DNS " + dnsQueryCount);
   } else if (oledPage == 1) {
-    display.setTextAlignment(TEXT_ALIGN_LEFT);
-    display.setFont(ArialMT_Plain_10);
-    drawLine(0, "UTC");
-    if (servingTime) {
-      drawCentered(17, formatUtc(nowUsec).substring(11), ArialMT_Plain_24);
-      display.setFont(ArialMT_Plain_10);
-      drawCentered(48, formatUtc(nowUsec).substring(0, 10), ArialMT_Plain_10);
-    } else {
-      drawCentered(20, "NO GPS", ArialMT_Plain_24);
-      drawCentered(48, "TIME", ArialMT_Plain_10);
-    }
+    drawTimePage("UTC", servingTime ? formatUtc(nowUsec) : "", servingTime);
   } else if (oledPage == 2) {
-    String grid = gps.location.isValid() ? maidenhead(gps.location.lat(), gps.location.lng()) : "";
+    drawTimePage("Local Time", servingTime ? formatLocal(nowUsec) : "", servingTime);
+  } else if (oledPage == 3) {
+    String grid = gpsFix ? maidenhead(gps.location.lat(), gps.location.lng()) : "";
     display.setTextAlignment(TEXT_ALIGN_LEFT);
     display.setFont(ArialMT_Plain_10);
-    drawLine(0, "Maidenhead");
+    drawLine(0, "Grid Square");
     drawCentered(17, grid.length() ? grid : "--", ArialMT_Plain_24);
     display.setFont(ArialMT_Plain_10);
     drawCentered(48, gpsFix ? "GPS fix" : "waiting for fix", ArialMT_Plain_10);
-  } else if (oledPage == 3) {
-    drawLine(0, String("Sat ") + (gps.satellites.isValid() ? gps.satellites.value() : 0) + " DOP " + gpsDopString());
-    drawLine(12, gps.location.isValid() ? String(gps.location.lat(), 5) : "lat --");
-    drawLine(24, gps.location.isValid() ? String(gps.location.lng(), 5) : "lon --");
-    drawLine(36, gps.altitude.isValid() ? "Alt " + String(gps.altitude.meters(), 1) + " m" : "Alt --");
-    drawLine(48, gps.location.isValid() ? "Grid " + maidenhead(gps.location.lat(), gps.location.lng()) : "Grid --");
   } else if (oledPage == 4) {
+    drawText(0, String("Sat ") + (gps.satellites.isValid() ? gps.satellites.value() : 0) + " DOP " + gpsDopString(), ArialMT_Plain_16);
+    drawText(16, gpsFix ? "Lat " + String(gps.location.lat(), 4) : "Lat --", ArialMT_Plain_16);
+    drawText(32, gpsFix ? "Lon " + String(gps.location.lng(), 4) : "Lon --", ArialMT_Plain_16);
+    drawText(48, gpsFix && gps.altitude.isValid() ? "Alt " + String(gps.altitude.meters(), 0) + "m" : "Alt --", ArialMT_Plain_16);
+  } else if (oledPage == 5) {
     drawLine(0, networkMode == NetworkMode::Sta ? "Network client" : "Standalone AP");
-    drawLine(12, networkMode == NetworkMode::Sta ? WiFi.SSID() : expandedApSsid());
+    drawScrollingText(12, networkMode == NetworkMode::Sta ? WiFi.SSID() : expandedApSsid(), ArialMT_Plain_10);
     drawLine(24, networkMode == NetworkMode::Sta ? WiFi.localIP().toString() : WiFi.softAPIP().toString());
     drawLine(36, String("Clients ") + (networkMode == NetworkMode::ApFallback ? WiFi.softAPgetStationNum() : 0) + "/" + settings.apMaxClients);
-    drawLine(48, String("Opt42 ") + (settings.dhcpOption42 ? "on" : "off") + " DNS " + (dnsOnline ? "on" : "off"));
+    drawScrollingText(48, "Pass " + apPasswordForDisplay(), ArialMT_Plain_10);
   } else {
-    drawLine(0, powerState.online ? "AXP192 online" : "PMU offline");
-    drawLine(12, powerState.batteryPresent ? String("Bat ") + powerState.batteryMv + " mV" : "No battery");
-    drawLine(24, String("I ") + powerState.batteryCurrentMa + " mA");
-    drawLine(36, powerState.vbusPresent ? String("USB ") + powerState.vbusMv + " mV" : "USB absent");
-    drawLine(48, powerState.warning ? "Battery warning" : String("Temp ") + powerState.temperatureC + " C");
+    drawText(0, powerState.batteryPresent ? String("Bat ") + powerState.batteryMv + "mV" : "No battery", ArialMT_Plain_16);
+    drawText(16, String("I ") + String(powerState.batteryCurrentMa, 0) + "mA", ArialMT_Plain_16);
+    drawText(32, powerState.vbusPresent ? String("USB ") + powerState.vbusMv + "mV" : "USB absent", ArialMT_Plain_16);
+    drawText(48, powerState.warning ? String("Bat warning") : String("Temp ") + String(powerState.temperatureC, 0) + "C", ArialMT_Plain_16);
   }
 
   display.display();
@@ -1823,14 +2050,17 @@ static void handleUserButton() {
       pressedAtMs = millis();
       longPressHandled = false;
       pressWokeDisplay = oledSleeping;
+      factoryResetConfirmHoldArmed = factoryResetConfirmPending && beforeDeadline(factoryResetConfirmUntilMs);
       wakeOled();
+      pauseOledAutoCycle();
     } else {
       uint32_t pressDuration = pressedAtMs ? millis() - pressedAtMs : 0;
       if (!longPressHandled && !pressWokeDisplay && pressDuration < USER_BUTTON_FACTORY_RESET_MS) {
         oledPage = (oledPage + 1) % OLED_PAGE_COUNT;
-        lastOledCycleMs = millis();
+        pauseOledAutoCycle();
         lastOledUpdateMs = 0;
       }
+      factoryResetConfirmHoldArmed = false;
       pressedAtMs = 0;
     }
   }
@@ -1838,7 +2068,13 @@ static void handleUserButton() {
   if (stableState == LOW && pressedAtMs != 0 && !longPressHandled &&
       millis() - pressedAtMs >= USER_BUTTON_FACTORY_RESET_MS) {
     longPressHandled = true;
-    factoryResetSettings("runtime button hold");
+    if (factoryResetConfirmHoldArmed) {
+      factoryResetSettings("runtime confirmed button hold");
+    } else {
+      factoryResetConfirmPending = false;
+      factoryResetConfirmHoldArmed = false;
+      requestFactoryResetConfirmation("runtime button hold");
+    }
   }
 }
 
@@ -1875,7 +2111,6 @@ void setup() {
   if (!LittleFS.begin(true)) {
     Serial.println("LittleFS mount failed");
   }
-  checkBootFactoryReset();
   loadSettings();
 
   beginPower();
@@ -1883,20 +2118,18 @@ void setup() {
   oledOnline = display.init();
   if (oledOnline) {
     display.flipScreenVertically();
-    display.clear();
-    display.setFont(ArialMT_Plain_10);
-    display.drawString(0, 0, "T-Beam NTP boot");
-    display.display();
+    showBootSplash();
     lastOledActivityMs = millis();
     lastOledCycleMs = millis();
   }
+  checkBootFactoryReset();
 
   pinMode(PIN_GPS_PPS, INPUT);
   attachInterrupt(PIN_GPS_PPS, onPps, RISING);
   GPSSerial.begin(GPS_BAUD, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
 
   scanI2c();
-  if (!startStaMode()) {
+  if (bootForceApMode || !startStaMode()) {
     startApMode();
   }
   startNtp();

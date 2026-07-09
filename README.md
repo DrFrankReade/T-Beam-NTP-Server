@@ -14,11 +14,13 @@ NTP itself is always UTC. Local time and daylight-saving settings only affect th
 - In AP mode, DHCP can advertise the T-Beam itself as the NTP server with DHCP option 42.
 - In AP mode, local DNS can answer common public NTP hostnames with the T-Beam IP.
 - Provides a captive portal for WiFi onboarding, AP settings, NTP alias settings, display settings, local time settings, and conservative Li-Ion power settings.
-- Shows GPS, UTC, local time, Maidenhead grid, WiFi, and power status on the onboard OLED.
+- Captive portal sections are collapsible and show caret indicators for collapsed/expanded state.
+- Shows GPS, UTC, local time, Grid Square / Maidenhead locator, WiFi, and power status on the onboard OLED.
 - Never transmits LoRa. Bluetooth is not used by the firmware.
 
 ## Current Build
 
+- Firmware version: `v0.1.2`
 - PlatformIO environment: `ttgo-t-beam`
 - Upload port: `COM28`
 - Filesystem: LittleFS, 1 MB at `0x300000`
@@ -52,6 +54,7 @@ Binary releases include:
 With no configured home WiFi, the device starts in AP mode:
 
 - SSID: `TBeam-NTP-{mac}`
+- Password: `tbeam-ntp`
 - Default IP: `192.168.4.1`
 - Portal: `http://192.168.4.1/`
 - NTP: UDP/123 on the device IP
@@ -101,11 +104,18 @@ If the POSIX TZ/DST option is disabled, the firmware falls back to either the ro
 
 ## OLED And Button
 
-The OLED cycles screens every 5 seconds by default. The cycle setting and screensaver timeout are configurable in the portal.
+The OLED cycles screens every 5 seconds by default. The cycle setting and screensaver timeout are configurable in the portal. Manual cycling pauses automatic cycling for 30 seconds; the screensaver timeout still applies normally.
 
-Dedicated large-format screens are provided for UTC time and the Maidenhead grid locator. Other screens show GPS detail, network state, connected AP clients, and power status.
+Dedicated large-format screens are provided for UTC time, local time, and the Grid Square / Maidenhead locator. Other screens show GPS detail, network state, connected AP clients, and power status.
 
-The user button wakes the screen. A short press cycles screens when the display is awake. Holding the button for 10 seconds at boot or runtime resets the device to defaults.
+The user button wakes the screen. A short press cycles screens when the display is awake. Long AP SSID and AP password values scroll on the OLED network page.
+
+Boot button behavior:
+
+- Hold the user button during boot and release it before 10 seconds to force standalone AP mode for that boot.
+- Hold it for 10 seconds at boot to request factory reset, then release and hold again for 10 seconds within the confirmation window to clear saved settings.
+
+Runtime reset uses the same confirmation model: hold for 10 seconds to show the reset confirmation screen, then hold again for 10 seconds to reset.
 
 ## Power Defaults
 
