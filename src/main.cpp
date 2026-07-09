@@ -46,7 +46,7 @@ static constexpr uint8_t OLED_PAGE_COUNT = 7;
 static constexpr uint32_t USER_BUTTON_FACTORY_RESET_MS = 10000;
 static constexpr uint32_t FACTORY_RESET_CONFIRM_WINDOW_MS = 30000;
 static constexpr uint32_t OLED_MANUAL_CYCLE_PAUSE_MS = 30000;
-static constexpr const char *FIRMWARE_VERSION = "v0.1.7";
+static constexpr const char *FIRMWARE_VERSION = "v0.1.8";
 static constexpr const char *DEFAULT_POSIX_TZ = "PST8PDT,M3.2.0/2,M11.1.0/2";
 static constexpr const char *DEFAULT_IANA_TIME_ZONE = "America/Los_Angeles";
 static constexpr const char *DEFAULT_AP_PASSWORD = "tbeam-ntp";
@@ -205,6 +205,7 @@ static time_t lastNmeaEpoch = 0;
 static uint32_t lastNmeaUpdateMs = 0;
 
 static void wakeOled();
+static void wakeOledForPowerWarning();
 
 struct PsramJsonAllocator {
   void *allocate(size_t size) {
@@ -1260,6 +1261,7 @@ static void pollPower() {
     return;
   }
   lastPowerPollMs = millis();
+  bool wasWarning = powerState.warning;
 
   powerState.batteryPresent = pmu.isBatteryConnect();
   powerState.charging = powerState.batteryPresent && pmu.isCharging();
@@ -1282,6 +1284,10 @@ static void pollPower() {
 
   powerState.warning = powerState.batteryPresent && powerState.discharging &&
                        powerState.batteryMv > 0 && powerState.batteryMv <= settings.warningVoltageMv;
+  if (powerState.warning && !wasWarning) {
+    wakeOledForPowerWarning();
+  }
+
   bool belowCutoff = powerState.batteryPresent && powerState.discharging &&
                      powerState.batteryMv > 0 && powerState.batteryMv <= settings.cutoffVoltageMv;
   if (belowCutoff) {
@@ -2248,6 +2254,35 @@ static void sleepOled() {
   oledSleeping = true;
 }
 
+static void wakeOledForPowerWarning() {
+  if (!oledOnline) {
+    return;
+  }
+  if (oledSleeping) {
+    display.displayOn();
+    oledSleeping = false;
+    lastOledActivityMs = millis();
+  }
+  lastOledUpdateMs = 0;
+}
+
+static void drawLowBatteryOverlay() {
+  if (!powerState.warning || ((millis() / 500UL) & 1UL) != 0) {
+    return;
+  }
+
+  const String label = "LOW BATTERY";
+  display.setFont(ArialMT_Plain_10);
+  int width = min(128, display.getStringWidth(label) + 6);
+  int x = 128 - width;
+  int y = 51;
+  display.setColor(WHITE);
+  display.fillRect(x, y, width, 13);
+  display.setColor(BLACK);
+  display.drawString(x + 3, y + 1, label);
+  display.setColor(WHITE);
+}
+
 static void factoryResetSettings(const char *reason) {
   Serial.printf("Factory reset requested: %s\n", reason ? reason : "user button");
   showFactoryResetPrompt();
@@ -2357,7 +2392,7 @@ static void updateOled() {
     lastOledUpdateMs = 0;
   }
 
-  uint32_t refreshMs = networkPageHasScrollingText() ? 250UL : 1000UL;
+  uint32_t refreshMs = (powerState.warning || networkPageHasScrollingText()) ? 250UL : 1000UL;
   if (millis() - lastOledUpdateMs < refreshMs) {
     return;
   }
@@ -2403,6 +2438,7 @@ static void updateOled() {
     drawText(48, powerState.warning ? String("Bat warning") : String("Temp ") + String(powerState.temperatureC, 0) + "C", ArialMT_Plain_16);
   }
 
+  drawLowBatteryOverlay();
   display.display();
 }
 
