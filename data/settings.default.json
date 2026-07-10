@@ -79,7 +79,8 @@
   "display": {
     "autoCycle": true,
     "cycleSeconds": 5,
-    "screensaverTimeoutSec": 300
+    "screensaverTimeoutSec": 300,
+    "portalTimeoutSec": 300
   },
   "power": {
     "chargeEnabled": true,

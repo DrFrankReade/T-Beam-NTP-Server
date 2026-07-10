@@ -3,7 +3,9 @@
 
 There are a great number of Lilygo / T-Beams out there from disappointing Meshtastic experiments. Now's a chance to give them new purpose. They've got a nice form factor, run on batteries, have screens, GPS antennas and can fit in pockets if you pull off the external antenna. 
 
-This is firmware speciffically for the LilyGo/TTGO T-Beam v1.1. It turns it into a GPS/PPS disciplined standalone Stratum 1 NTP server.
+This is firmware for the LilyGo/TTGO T-Beam, tested on T-Beam v1.1 hardware. It turns the board into a GPS/PPS disciplined standalone Stratum 1 NTP server. Provisional T-Beam v1.2 support is included, but v1.2 hardware has not been tested yet. Use v1.2 support at your own risk.
+
+This project controls Li-Ion charging hardware, WiFi, GPS timing, and power-management rails. It is all use-at-your-own-risk firmware. Verify the hardware, battery chemistry, charging settings, and behavior before trusting it unattended.
 
 The primary audience is the ham radio community and anyone else who needs accurate, stratum 1 local network time in remote, austere, or off-grid environments. The device can run as its own WiFi access point, DHCP server, DNS helper, captive portal, and NTP server, or it can join an existing LAN as a normal WiFi client.
 
@@ -29,17 +31,19 @@ NTP itself is always UTC. Local time and daylight-saving settings only affect th
 
 ## Current Build
 
-- Firmware version: `v0.1.8`
+- Firmware version: `v0.1.9`
 - PlatformIO environment: `ttgo-t-beam`
 - Upload port: `COM28`
 - Filesystem: LittleFS, 1 MB at `0x300000`
 - App partition: no OTA, about 3 MB
 - Bluetooth: not used by the firmware
-- LoRa: no LoRa library is initialized and no transmit path is used; AXP192 LDO2 is disabled by default
+- LoRa: no LoRa library is initialized and no transmit path is used; the LoRa power rail is treated as unused
 
 ## Flash
 
-Use the local PlatformIO executable:
+### PlatformIO Development Flash
+
+Use the local PlatformIO executable when building from source:
 
 ```powershell
 $env:PYTHONIOENCODING='utf-8'
@@ -48,13 +52,39 @@ $env:PYTHONIOENCODING='utf-8'
 & "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -t uploadfs
 ```
 
-`uploadfs` installs `data/settings.default.json`. Runtime settings are saved to `/settings.json` only when the portal Save action is used.
+`uploadfs` installs `data/index.html`, `data/settings.default.json`, and the timezone preset file. A PlatformIO pre-script generates `data/index.html.gz` from the readable portal source so browsers use less airtime. Runtime settings are saved to `/settings.json` only when the portal Save action is used.
 
-Binary releases include:
+### Combined Binary Release Flash
 
-- `firmware.bin` for the application partition
-- `littlefs.bin` containing factory defaults
-- `partitions.csv` describing the flash layout
+GitHub releases include a single combined image named like:
+
+```text
+t-beam-ntp-server-v0.1.9-combined.bin
+```
+
+This image includes the bootloader, partition table, boot app data, firmware, and LittleFS portal/settings defaults. Flashing it is intentionally simple and will erase the previous contents of the device, including saved settings.
+
+Install the usual ESP32 flashing tool:
+
+```powershell
+py -m pip install esptool
+```
+
+Then flash the combined image. Replace `COM28` with your serial port:
+
+```powershell
+py -m esptool --chip esp32 --port COM28 --baud 460800 erase_flash
+py -m esptool --chip esp32 --port COM28 --baud 460800 write_flash -z 0x0 t-beam-ntp-server-v0.1.9-combined.bin
+```
+
+If you already have PlatformIO installed, its bundled esptool also works:
+
+```powershell
+& "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" -m esptool --chip esp32 --port COM28 --baud 460800 erase_flash
+& "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" -m esptool --chip esp32 --port COM28 --baud 460800 write_flash -z 0x0 t-beam-ntp-server-v0.1.9-combined.bin
+```
+
+After flashing, reset the board and join the default AP shown below.
 
 ## First Boot
 
@@ -82,9 +112,13 @@ The T-Beam can also join an existing WiFi network by selecting Client Mode with 
 
 Standalone AP security is configurable as Open, WPA2-Personal, WPA/WPA2 legacy, WPA2/WPA3 transition, or WPA3-Personal. WEP sucks and ESP32 SoftAP doesn't support it anyway.
 
-## Hardware Assumptions
+## Hardware Support
 
-- AXP192 PMU on I2C `SDA=21`, `SCL=22`, IRQ `GPIO35`
+- T-Beam v1.1 with AXP192 PMU is tested.
+- T-Beam v1.2 with AXP2101 PMU has provisional support, but remains untested until v1.2 hardware is available. Use at your own risk.
+- Hardware revision is detected automatically from the PMIC register `0x03`.
+- The firmware does not care which LoRa radio is installed, or whether one is present.
+- PMU I2C: `SDA=21`, `SCL=22`, IRQ `GPIO35`
 - GPS UART RX/TX: ESP32 RX `GPIO34`, TX `GPIO12`, 9600 baud
 - GPS PPS input: `GPIO37`, rising edge
 - User button: `GPIO38`
@@ -157,5 +191,6 @@ For low-rate DHCP/DNS/NTP traffic, 8 clients is a reasonable starting point on t
 - PPS discipline is implemented in firmware using GPS NMEA plus the PPS interrupt. It is suitable for this embedded NTP role, but it is not a full temperature-compensated oscillator PLL. 
 - It's only IPv4 - Is this really a problem?
 - DHCP option 42 is configured through the ESP32 lwIP DHCP server option hook. Some clients don't visibly report received option 42 even when they accept the DHCP lease, and there's no guarantee that they're going to do anything with it if they do take it, hence the DNS wildcards. 
-- The current builds are unsuitable for other T-Beam revisions outside the 1.1 T-Beam hardware as of v0.1.8 - This is due to different power handling ICs throughout the product line. This could be a "bad thing" since lithium batteries are involved.  The author doesn't have access to other hardware for testing. 
+- T-Beam v1.2 support is provisional and untested. The firmware now detects AXP192 vs AXP2101 PMUs and maps the relevant rails, but only v1.1 hardware has been validated so far.
+- Other T-Beam revisions remain unsupported unless their PMIC and rail mapping are explicitly verified. This matters because lithium batteries and power rails are involved.
 - Power usage hasn't been optimized. 

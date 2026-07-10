@@ -39,18 +39,27 @@ static constexpr uint32_t SERIAL_BAUD = 115200;
 static constexpr uint32_t GPS_BAUD = 9600;
 static constexpr uint16_t NTP_PORT = 123;
 static constexpr uint16_t DNS_PORT = 53;
+static constexpr size_t NTP_PACKET_SIZE = 48;
+static constexpr size_t DNS_PACKET_MAX_SIZE = 512;
+static constexpr size_t DNS_RESPONSE_MAX_SIZE = 576;
+static constexpr size_t DNS_HEADER_SIZE = 12;
 static constexpr size_t MAX_NTP_HOSTS = 64;
 static constexpr size_t POSIX_TZ_MAX_LEN = 96;
 static constexpr uint64_t UNIX_TO_NTP_SECONDS = 2208988800ULL;
 static constexpr uint8_t OLED_PAGE_COUNT = 7;
+static constexpr uint32_t POWER_POLL_INTERVAL_MS = 1000;
+static constexpr uint32_t BATTERY_CUTOFF_DEBOUNCE_MS = 30000;
 static constexpr uint32_t USER_BUTTON_FACTORY_RESET_MS = 10000;
 static constexpr uint32_t FACTORY_RESET_CONFIRM_WINDOW_MS = 30000;
 static constexpr uint32_t OLED_MANUAL_CYCLE_PAUSE_MS = 30000;
-static constexpr const char *FIRMWARE_VERSION = "v0.1.8";
+static constexpr const char *FIRMWARE_VERSION = "v0.1.9";
 static constexpr const char *DEFAULT_POSIX_TZ = "PST8PDT,M3.2.0/2,M11.1.0/2";
 static constexpr const char *DEFAULT_IANA_TIME_ZONE = "America/Los_Angeles";
 static constexpr const char *DEFAULT_AP_PASSWORD = "tbeam-ntp";
 static constexpr const char *TIMEZONE_DB_PATH = "/timezones.current.tsv";
+static constexpr const char *PORTAL_HTML_PATH = "/index.html";
+static constexpr const char *PORTAL_GZIP_PATH = "/index.html.gz";
+static constexpr size_t FILE_STREAM_BUFFER_SIZE = 1024;
 
 enum class NetworkMode {
   ApFallback,
@@ -68,6 +77,18 @@ enum class ApSecurityMode : uint8_t {
   WpaWpa2,
   Wpa2Wpa3,
   Wpa3
+};
+
+enum class HardwareRevision : uint8_t {
+  Unknown,
+  TBeamV11,
+  TBeamV12
+};
+
+enum class PmicModel : uint8_t {
+  None,
+  Axp192,
+  Axp2101
 };
 
 enum class LocalTimeMode : uint8_t {
@@ -114,6 +135,7 @@ struct DeviceSettings {
   bool oledAutoCycle;
   uint8_t oledCycleSeconds;
   uint16_t oledScreensaverTimeoutSec;
+  uint16_t portalTimeoutSec;
 
   bool chargeEnabled;
   uint16_t chargeCurrentMa;
@@ -142,9 +164,67 @@ struct PowerState {
   bool cutoffPending = false;
 };
 
+class CaptivePortalWebServer : public WebServer {
+public:
+  using WebServer::WebServer;
+
+  void handleClient() override {
+    static constexpr uint32_t CLIENT_DATA_WAIT_MS = 250;
+
+    if (_currentStatus == HC_NONE) {
+      _currentClient = _server.available();
+      if (!_currentClient) {
+        if (_nullDelay) {
+          delay(1);
+        }
+        return;
+      }
+
+      _currentStatus = HC_WAIT_READ;
+      _statusChange = millis();
+    }
+
+    bool keepCurrentClient = false;
+    bool callYield = false;
+
+    if (_currentClient.connected()) {
+      switch (_currentStatus) {
+        case HC_NONE:
+          break;
+        case HC_WAIT_READ:
+          if (_currentClient.available()) {
+            if (_parseRequest(_currentClient)) {
+              _currentClient.setTimeout(1);
+              _contentLength = CONTENT_LENGTH_NOT_SET;
+              _handleRequest();
+            }
+          } else {
+            keepCurrentClient = millis() - _statusChange <= CLIENT_DATA_WAIT_MS;
+            callYield = true;
+          }
+          break;
+        case HC_WAIT_CLOSE:
+          callYield = true;
+          break;
+      }
+    }
+
+    if (!keepCurrentClient) {
+      _currentClient = WiFiClient();
+      _currentStatus = HC_NONE;
+      _currentUpload.reset();
+      _currentRaw.reset();
+    }
+
+    if (callYield) {
+      yield();
+    }
+  }
+};
+
 static DeviceSettings settings;
 static PowerState powerState;
-static WebServer server(80);
+static CaptivePortalWebServer server(80);
 static WiFiUDP ntpUdp;
 static WiFiUDP dnsUdp;
 static HardwareSerial GPSSerial(1);
@@ -156,14 +236,23 @@ static TinyGPSCustom pdopGn(gps, "GNGSA", 15);
 static TinyGPSCustom hdopGn(gps, "GNGSA", 16);
 static TinyGPSCustom vdopGn(gps, "GNGSA", 17);
 static SSD1306Wire display(0x3C, PIN_I2C_SDA, PIN_I2C_SCL);
-static XPowersPMU pmu;
+static XPowersAXP192 pmu192(Wire);
+static XPowersAXP2101 pmu2101(Wire);
+static XPowersLibInterface *pmu = nullptr;
 
 static NetworkMode networkMode = NetworkMode::ApFallback;
+static HardwareRevision hardwareRevision = HardwareRevision::Unknown;
+static PmicModel pmicModel = PmicModel::None;
+static uint8_t pmicRegister03 = 0;
+static bool pmicRegister03Valid = false;
 static bool oledOnline = false;
 static bool ntpOnline = false;
 static bool dnsOnline = false;
 static bool mdnsOnline = false;
+static bool timezoneDbPresent = false;
+static bool portalGzipPresent = false;
 static uint32_t ntpRequestCount = 0;
+static uint32_t ntpResponseCount = 0;
 static uint32_t ntpSuppressedCount = 0;
 static uint32_t dnsQueryCount = 0;
 static uint32_t dnsAliasHitCount = 0;
@@ -333,6 +422,26 @@ static const char *wifiAuthModeLabel(wifi_auth_mode_t mode) {
   }
 }
 
+static bool isAsciiAlpha(char c) {
+  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+static bool isAsciiDigit(char c) {
+  return c >= '0' && c <= '9';
+}
+
+static bool isAsciiAlnum(char c) {
+  return isAsciiAlpha(c) || isAsciiDigit(c);
+}
+
+static bool isPosixTimezoneChar(char c) {
+  return c >= 33 && c <= 126;
+}
+
+static bool isIanaTimezoneChar(char c) {
+  return isAsciiAlnum(c) || c == '/' || c == '_' || c == '-' || c == '+';
+}
+
 static void copyPosixTimezone(char *dst, size_t len, const char *src) {
   if (len == 0) {
     return;
@@ -344,7 +453,7 @@ static void copyPosixTimezone(char *dst, size_t len, const char *src) {
   size_t out = 0;
   for (size_t i = 0; src[i] != '\0' && out + 1 < len; ++i) {
     char c = src[i];
-    if (c >= 33 && c <= 126) {
+    if (isPosixTimezoneChar(c)) {
       dst[out++] = c;
     }
   }
@@ -362,10 +471,7 @@ static void copyIanaTimeZone(char *dst, size_t len, const char *src) {
   size_t out = 0;
   for (size_t i = 0; src[i] != '\0' && out + 1 < len; ++i) {
     char c = src[i];
-    bool allowed = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                   (c >= '0' && c <= '9') || c == '/' || c == '_' ||
-                   c == '-' || c == '+';
-    if (allowed) {
+    if (isIanaTimezoneChar(c)) {
       dst[out++] = c;
     }
   }
@@ -485,7 +591,7 @@ static void addDefaultNtpHosts() {
   }
 }
 
-static void setHardDefaults() {
+static void setWifiDefaults() {
   copyText(settings.hostname, sizeof(settings.hostname), "tbeam-ntp");
   settings.networkStartMode = NetworkStartMode::StandaloneAp;
   copyText(settings.staSsid, sizeof(settings.staSsid), "");
@@ -497,7 +603,9 @@ static void setHardDefaults() {
   settings.staDns1 = IPAddress(192, 168, 1, 1);
   settings.staDns2 = IPAddress(1, 1, 1, 1);
   settings.staConnectTimeoutSec = 25;
+}
 
+static void setApDefaults() {
   copyText(settings.apSsid, sizeof(settings.apSsid), "TBeam-NTP-{mac}");
   copyText(settings.apPassword, sizeof(settings.apPassword), DEFAULT_AP_PASSWORD);
   settings.apSecurityMode = ApSecurityMode::Wpa2;
@@ -505,23 +613,32 @@ static void setHardDefaults() {
   settings.apSubnet = IPAddress(255, 255, 255, 0);
   settings.apChannel = 6;
   settings.apMaxClients = 8;
+}
 
+static void setStandaloneDefaults() {
   settings.dhcpOption42 = true;
   settings.dnsNtpAliases = true;
   settings.dnsWildcardCaptive = true;
   addDefaultNtpHosts();
+}
 
+static void setTimeDefaults() {
   settings.autoLocalOffset = false;
   settings.manualOffsetMinutes = 0;
   settings.observeDst = true;
   settings.localTimeMode = LocalTimeMode::Iana;
   copyIanaTimeZone(settings.ianaTimeZone, sizeof(settings.ianaTimeZone), DEFAULT_IANA_TIME_ZONE);
   copyPosixTimezone(settings.posixTimezone, sizeof(settings.posixTimezone), DEFAULT_POSIX_TZ);
+}
 
+static void setDisplayDefaults() {
   settings.oledAutoCycle = true;
   settings.oledCycleSeconds = 5;
   settings.oledScreensaverTimeoutSec = 300;
+  settings.portalTimeoutSec = 300;
+}
 
+static void setPowerDefaults() {
   settings.chargeEnabled = true;
   settings.chargeCurrentMa = 280;
   settings.chargeTargetMv = 4100;
@@ -532,128 +649,182 @@ static void setHardDefaults() {
   settings.powerKeyOffSeconds = 6;
 }
 
-static bool applySettingsJson(JsonDocument &doc) {
-  bool explicitNetworkStartMode = false;
-  if (doc["networkMode"].is<const char *>()) {
-    settings.networkStartMode = parseNetworkStartMode(doc["networkMode"], settings.networkStartMode);
-    explicitNetworkStartMode = true;
-  }
+static void setHardDefaults() {
+  setWifiDefaults();
+  setApDefaults();
+  setStandaloneDefaults();
+  setTimeDefaults();
+  setDisplayDefaults();
+  setPowerDefaults();
+}
 
+static bool applyNetworkStartModeJson(JsonDocument &doc) {
+  if (!doc["networkMode"].is<const char *>()) {
+    return false;
+  }
+  settings.networkStartMode = parseNetworkStartMode(doc["networkMode"], settings.networkStartMode);
+  return true;
+}
+
+static void applyHostnameJson(JsonDocument &doc) {
   if (doc["hostname"].is<const char *>()) {
     copyText(settings.hostname, sizeof(settings.hostname), doc["hostname"]);
   }
+}
 
-  JsonObject wifi = doc["wifi"].as<JsonObject>();
-  if (!wifi.isNull()) {
-    if (wifi["ssid"].is<const char *>()) {
-      copyText(settings.staSsid, sizeof(settings.staSsid), wifi["ssid"]);
-    }
-    if (wifi["password"].is<const char *>()) {
-      copyText(settings.staPassword, sizeof(settings.staPassword), wifi["password"]);
-    }
-    settings.staDhcp = wifi["dhcp"] | settings.staDhcp;
-    settings.staIp = parseIp(wifi["staticIp"] | nullptr, settings.staIp);
-    settings.staGateway = parseIp(wifi["gateway"] | nullptr, settings.staGateway);
-    settings.staSubnet = parseIp(wifi["subnet"] | nullptr, settings.staSubnet);
-    settings.staDns1 = parseIp(wifi["dns1"] | nullptr, settings.staDns1);
-    settings.staDns2 = parseIp(wifi["dns2"] | nullptr, settings.staDns2);
-    settings.staConnectTimeoutSec = clampU16(wifi["connectTimeoutSec"] | settings.staConnectTimeoutSec, 5, 90);
+static void applyWifiSettingsJson(JsonObject wifi) {
+  if (wifi.isNull()) {
+    return;
   }
 
-  JsonObject ap = doc["ap"].as<JsonObject>();
-  if (!ap.isNull()) {
-    if (ap["ssid"].is<const char *>()) {
-      copyText(settings.apSsid, sizeof(settings.apSsid), ap["ssid"]);
-    }
-    if (ap["password"].is<const char *>()) {
-      copyText(settings.apPassword, sizeof(settings.apPassword), ap["password"]);
-    }
-    if (ap["security"].is<const char *>()) {
-      settings.apSecurityMode = parseApSecurityMode(ap["security"], settings.apSecurityMode);
-    }
-    settings.apIp = parseIp(ap["ip"] | nullptr, settings.apIp);
-    settings.apSubnet = parseIp(ap["subnet"] | nullptr, settings.apSubnet);
-    settings.apChannel = clampU16(ap["channel"] | settings.apChannel, 1, 13);
-    settings.apMaxClients = clampU16(ap["maxClients"] | settings.apMaxClients, 1, 10);
+  if (wifi["ssid"].is<const char *>()) {
+    copyText(settings.staSsid, sizeof(settings.staSsid), wifi["ssid"]);
+  }
+  if (wifi["password"].is<const char *>()) {
+    copyText(settings.staPassword, sizeof(settings.staPassword), wifi["password"]);
   }
 
+  settings.staDhcp = wifi["dhcp"] | settings.staDhcp;
+  settings.staIp = parseIp(wifi["staticIp"] | nullptr, settings.staIp);
+  settings.staGateway = parseIp(wifi["gateway"] | nullptr, settings.staGateway);
+  settings.staSubnet = parseIp(wifi["subnet"] | nullptr, settings.staSubnet);
+  settings.staDns1 = parseIp(wifi["dns1"] | nullptr, settings.staDns1);
+  settings.staDns2 = parseIp(wifi["dns2"] | nullptr, settings.staDns2);
+  settings.staConnectTimeoutSec = clampU16(wifi["connectTimeoutSec"] | settings.staConnectTimeoutSec, 5, 90);
+}
+
+static void applyApSettingsJson(JsonObject ap) {
+  if (ap.isNull()) {
+    return;
+  }
+
+  if (ap["ssid"].is<const char *>()) {
+    copyText(settings.apSsid, sizeof(settings.apSsid), ap["ssid"]);
+  }
+  if (ap["password"].is<const char *>()) {
+    copyText(settings.apPassword, sizeof(settings.apPassword), ap["password"]);
+  }
+  if (ap["security"].is<const char *>()) {
+    settings.apSecurityMode = parseApSecurityMode(ap["security"], settings.apSecurityMode);
+  }
+
+  settings.apIp = parseIp(ap["ip"] | nullptr, settings.apIp);
+  settings.apSubnet = parseIp(ap["subnet"] | nullptr, settings.apSubnet);
+  settings.apChannel = clampU16(ap["channel"] | settings.apChannel, 1, 13);
+  settings.apMaxClients = clampU16(ap["maxClients"] | settings.apMaxClients, 1, 10);
+}
+
+static void normalizeNetworkSettings(bool explicitNetworkStartMode) {
   if (!explicitNetworkStartMode && strlen(settings.staSsid) > 0) {
     settings.networkStartMode = NetworkStartMode::ClientWithApFallback;
   }
-
   if (settings.apSecurityMode != ApSecurityMode::Open && strlen(settings.apPassword) < 8) {
     copyText(settings.apPassword, sizeof(settings.apPassword), DEFAULT_AP_PASSWORD);
   }
+}
 
-  JsonObject standalone = doc["standalone"].as<JsonObject>();
-  if (!standalone.isNull()) {
-    settings.dhcpOption42 = standalone["dhcpOption42"] | settings.dhcpOption42;
-    settings.dnsNtpAliases = standalone["dnsNtpAliases"] | settings.dnsNtpAliases;
-    settings.dnsWildcardCaptive = standalone["dnsWildcardCaptive"] | settings.dnsWildcardCaptive;
-    if (standalone["ntpHosts"].is<JsonArray>()) {
-      settings.ntpHostCount = 0;
-      for (JsonVariant value : standalone["ntpHosts"].as<JsonArray>()) {
-        if (value.is<const char *>()) {
-          addNtpHost(value.as<const char *>());
-        }
-      }
+static void applyNtpHostsJson(JsonArray hosts) {
+  settings.ntpHostCount = 0;
+  for (JsonVariant value : hosts) {
+    if (value.is<const char *>()) {
+      addNtpHost(value.as<const char *>());
     }
   }
+}
 
-  JsonObject time = doc["time"].as<JsonObject>();
-  if (!time.isNull()) {
-    settings.autoLocalOffset = time["autoLocalOffset"] | settings.autoLocalOffset;
-    settings.manualOffsetMinutes = clampI16(time["manualOffsetMinutes"] | settings.manualOffsetMinutes, -14 * 60, 14 * 60);
-    settings.observeDst = time["observeDst"] | settings.observeDst;
-    if (time["mode"].is<const char *>()) {
-      settings.localTimeMode = parseLocalTimeMode(time["mode"], settings.localTimeMode);
-    } else if (time["observeDst"].is<bool>()) {
-      settings.localTimeMode = settings.observeDst ? LocalTimeMode::Posix : LocalTimeMode::Offset;
-    }
-    if (time["ianaTimeZone"].is<const char *>()) {
-      copyIanaTimeZone(settings.ianaTimeZone, sizeof(settings.ianaTimeZone), time["ianaTimeZone"]);
-    }
-    if (time["posixTimezone"].is<const char *>()) {
-      copyPosixTimezone(settings.posixTimezone, sizeof(settings.posixTimezone), time["posixTimezone"]);
-    }
-    invalidateTimeZoneCache();
+static void applyStandaloneSettingsJson(JsonObject standalone) {
+  if (standalone.isNull()) {
+    return;
   }
 
-  JsonObject displaySettings = doc["display"].as<JsonObject>();
-  if (!displaySettings.isNull()) {
-    settings.oledAutoCycle = displaySettings["autoCycle"] | settings.oledAutoCycle;
-    settings.oledCycleSeconds = clampU16(displaySettings["cycleSeconds"] | settings.oledCycleSeconds, 2, 60);
-    settings.oledScreensaverTimeoutSec = clampU16(displaySettings["screensaverTimeoutSec"] | settings.oledScreensaverTimeoutSec, 0, 3600);
+  settings.dhcpOption42 = standalone["dhcpOption42"] | settings.dhcpOption42;
+  settings.dnsNtpAliases = standalone["dnsNtpAliases"] | settings.dnsNtpAliases;
+  settings.dnsWildcardCaptive = standalone["dnsWildcardCaptive"] | settings.dnsWildcardCaptive;
+  if (standalone["ntpHosts"].is<JsonArray>()) {
+    applyNtpHostsJson(standalone["ntpHosts"].as<JsonArray>());
+  }
+}
+
+static void applyTimeSettingsJson(JsonObject time) {
+  if (time.isNull()) {
+    return;
   }
 
-  JsonObject power = doc["power"].as<JsonObject>();
-  if (!power.isNull()) {
-    settings.chargeEnabled = power["chargeEnabled"] | settings.chargeEnabled;
-    settings.chargeCurrentMa = clampU16(power["chargeCurrentMa"] | settings.chargeCurrentMa, 100, 700);
-    settings.chargeTargetMv = clampU16(power["chargeTargetMv"] | settings.chargeTargetMv, 4100, 4200);
-    settings.vbusCurrentLimitMa = power["vbusCurrentLimitMa"] | settings.vbusCurrentLimitMa;
-    if (settings.vbusCurrentLimitMa != 100 && settings.vbusCurrentLimitMa != 500 && settings.vbusCurrentLimitMa != 0) {
-      settings.vbusCurrentLimitMa = 500;
-    }
-    settings.warningVoltageMv = clampU16(power["warningVoltageMv"] | settings.warningVoltageMv, 3200, 3900);
-    settings.cutoffVoltageMv = clampU16(power["cutoffVoltageMv"] | settings.cutoffVoltageMv, 3000, 3600);
-    settings.sysPowerDownMv = clampU16(power["sysPowerDownMv"] | settings.sysPowerDownMv, 2600, 3300);
-    settings.powerKeyOffSeconds = power["powerKeyOffSeconds"] | settings.powerKeyOffSeconds;
-    if (settings.powerKeyOffSeconds != 4 && settings.powerKeyOffSeconds != 6 &&
-        settings.powerKeyOffSeconds != 8 && settings.powerKeyOffSeconds != 10) {
-      settings.powerKeyOffSeconds = 6;
-    }
+  settings.autoLocalOffset = time["autoLocalOffset"] | settings.autoLocalOffset;
+  settings.manualOffsetMinutes = clampI16(time["manualOffsetMinutes"] | settings.manualOffsetMinutes, -14 * 60, 14 * 60);
+  settings.observeDst = time["observeDst"] | settings.observeDst;
+
+  if (time["mode"].is<const char *>()) {
+    settings.localTimeMode = parseLocalTimeMode(time["mode"], settings.localTimeMode);
+  } else if (time["observeDst"].is<bool>()) {
+    settings.localTimeMode = settings.observeDst ? LocalTimeMode::Posix : LocalTimeMode::Offset;
+  }
+  if (time["ianaTimeZone"].is<const char *>()) {
+    copyIanaTimeZone(settings.ianaTimeZone, sizeof(settings.ianaTimeZone), time["ianaTimeZone"]);
+  }
+  if (time["posixTimezone"].is<const char *>()) {
+    copyPosixTimezone(settings.posixTimezone, sizeof(settings.posixTimezone), time["posixTimezone"]);
   }
 
+  invalidateTimeZoneCache();
+}
+
+static void applyDisplaySettingsJson(JsonObject displaySettings) {
+  if (displaySettings.isNull()) {
+    return;
+  }
+
+  settings.oledAutoCycle = displaySettings["autoCycle"] | settings.oledAutoCycle;
+  settings.oledCycleSeconds = clampU16(displaySettings["cycleSeconds"] | settings.oledCycleSeconds, 2, 60);
+  settings.oledScreensaverTimeoutSec = clampU16(displaySettings["screensaverTimeoutSec"] | settings.oledScreensaverTimeoutSec, 0, 3600);
+  settings.portalTimeoutSec = clampU16(displaySettings["portalTimeoutSec"] | settings.portalTimeoutSec, 0, 7200);
+}
+
+static uint16_t normalizedVbusLimit(uint16_t limitMa) {
+  if (limitMa == 100 || limitMa == 500 || limitMa == 0) {
+    return limitMa;
+  }
+  return 500;
+}
+
+static uint8_t normalizedPowerKeySeconds(uint8_t seconds) {
+  if (seconds == 4 || seconds == 6 || seconds == 8 || seconds == 10) {
+    return seconds;
+  }
+  return 6;
+}
+
+static void applyPowerSettingsJson(JsonObject power) {
+  if (power.isNull()) {
+    return;
+  }
+
+  settings.chargeEnabled = power["chargeEnabled"] | settings.chargeEnabled;
+  settings.chargeCurrentMa = clampU16(power["chargeCurrentMa"] | settings.chargeCurrentMa, 100, 700);
+  settings.chargeTargetMv = clampU16(power["chargeTargetMv"] | settings.chargeTargetMv, 4100, 4200);
+  settings.vbusCurrentLimitMa = normalizedVbusLimit(power["vbusCurrentLimitMa"] | settings.vbusCurrentLimitMa);
+  settings.warningVoltageMv = clampU16(power["warningVoltageMv"] | settings.warningVoltageMv, 3200, 3900);
+  settings.cutoffVoltageMv = clampU16(power["cutoffVoltageMv"] | settings.cutoffVoltageMv, 3000, 3600);
+  settings.sysPowerDownMv = clampU16(power["sysPowerDownMv"] | settings.sysPowerDownMv, 2600, 3300);
+  settings.powerKeyOffSeconds = normalizedPowerKeySeconds(power["powerKeyOffSeconds"] | settings.powerKeyOffSeconds);
+}
+
+static bool applySettingsJson(JsonDocument &doc) {
+  bool explicitNetworkStartMode = applyNetworkStartModeJson(doc);
+  applyHostnameJson(doc);
+  applyWifiSettingsJson(doc["wifi"].as<JsonObject>());
+  applyApSettingsJson(doc["ap"].as<JsonObject>());
+  normalizeNetworkSettings(explicitNetworkStartMode);
+  applyStandaloneSettingsJson(doc["standalone"].as<JsonObject>());
+  applyTimeSettingsJson(doc["time"].as<JsonObject>());
+  applyDisplaySettingsJson(doc["display"].as<JsonObject>());
+  applyPowerSettingsJson(doc["power"].as<JsonObject>());
   return true;
 }
 
 static String expandedApSsid();
 
-static void settingsToJson(JsonDocument &doc) {
-  doc["networkMode"] = networkStartModeName(settings.networkStartMode);
-  doc["hostname"] = settings.hostname;
-
+static void writeWifiSettingsJson(JsonDocument &doc) {
   JsonObject wifi = doc.createNestedObject("wifi");
   wifi["ssid"] = settings.staSsid;
   wifi["password"] = settings.staPassword;
@@ -664,7 +835,9 @@ static void settingsToJson(JsonDocument &doc) {
   wifi["dns1"] = ipToString(settings.staDns1);
   wifi["dns2"] = ipToString(settings.staDns2);
   wifi["connectTimeoutSec"] = settings.staConnectTimeoutSec;
+}
 
+static void writeApSettingsJson(JsonDocument &doc) {
   JsonObject ap = doc.createNestedObject("ap");
   ap["ssid"] = settings.apSsid;
   ap["password"] = settings.apPassword;
@@ -674,7 +847,9 @@ static void settingsToJson(JsonDocument &doc) {
   ap["channel"] = settings.apChannel;
   ap["maxClients"] = settings.apMaxClients;
   ap["expandedSsid"] = expandedApSsid();
+}
 
+static void writeStandaloneSettingsJson(JsonDocument &doc) {
   JsonObject standalone = doc.createNestedObject("standalone");
   standalone["dhcpOption42"] = settings.dhcpOption42;
   standalone["dnsNtpAliases"] = settings.dnsNtpAliases;
@@ -683,7 +858,9 @@ static void settingsToJson(JsonDocument &doc) {
   for (size_t i = 0; i < settings.ntpHostCount; ++i) {
     hosts.add(settings.ntpHosts[i]);
   }
+}
 
+static void writeTimeSettingsJson(JsonDocument &doc) {
   JsonObject time = doc.createNestedObject("time");
   time["mode"] = localTimeModeName(settings.localTimeMode);
   time["autoLocalOffset"] = settings.autoLocalOffset;
@@ -692,12 +869,17 @@ static void settingsToJson(JsonDocument &doc) {
   time["ianaTimeZone"] = settings.ianaTimeZone;
   time["posixTimezone"] = settings.posixTimezone;
   time["databasePath"] = TIMEZONE_DB_PATH;
+}
 
+static void writeDisplaySettingsJson(JsonDocument &doc) {
   JsonObject displaySettings = doc.createNestedObject("display");
   displaySettings["autoCycle"] = settings.oledAutoCycle;
   displaySettings["cycleSeconds"] = settings.oledCycleSeconds;
   displaySettings["screensaverTimeoutSec"] = settings.oledScreensaverTimeoutSec;
+  displaySettings["portalTimeoutSec"] = settings.portalTimeoutSec;
+}
 
+static void writePowerSettingsJson(JsonDocument &doc) {
   JsonObject power = doc.createNestedObject("power");
   power["chargeEnabled"] = settings.chargeEnabled;
   power["chargeCurrentMa"] = settings.chargeCurrentMa;
@@ -707,6 +889,18 @@ static void settingsToJson(JsonDocument &doc) {
   power["cutoffVoltageMv"] = settings.cutoffVoltageMv;
   power["sysPowerDownMv"] = settings.sysPowerDownMv;
   power["powerKeyOffSeconds"] = settings.powerKeyOffSeconds;
+}
+
+static void settingsToJson(JsonDocument &doc) {
+  doc["networkMode"] = networkStartModeName(settings.networkStartMode);
+  doc["hostname"] = settings.hostname;
+
+  writeWifiSettingsJson(doc);
+  writeApSettingsJson(doc);
+  writeStandaloneSettingsJson(doc);
+  writeTimeSettingsJson(doc);
+  writeDisplaySettingsJson(doc);
+  writePowerSettingsJson(doc);
 }
 
 static bool littleFsFileExists(const char *path);
@@ -784,6 +978,11 @@ static bool littleFsFileExists(const char *path) {
   return false;
 }
 
+static void refreshLittleFsPresenceFlags() {
+  timezoneDbPresent = littleFsFileExists(TIMEZONE_DB_PATH);
+  portalGzipPresent = littleFsFileExists(PORTAL_GZIP_PATH);
+}
+
 static String macSuffix() {
   uint64_t mac = ESP.getEfuseMac();
   char buf[7];
@@ -803,26 +1002,46 @@ static String expandedApSsid() {
   return ssid.substring(0, 32);
 }
 
+static bool isHostnameChar(char c) {
+  return (c >= 'a' && c <= 'z') || isAsciiDigit(c) || c == '-';
+}
+
+static bool isHostnameSeparator(char c) {
+  return c == '_' || c == ' ' || c == '.';
+}
+
+static char normalizedHostnameChar(char c) {
+  if (isHostnameChar(c)) {
+    return c;
+  }
+  if (isHostnameSeparator(c)) {
+    return '-';
+  }
+  return '\0';
+}
+
+static void trimHostnameDashes(String &host) {
+  while (host.startsWith("-")) {
+    host.remove(0, 1);
+  }
+  while (host.endsWith("-")) {
+    host.remove(host.length() - 1);
+  }
+}
+
 static String sanitizedHostname() {
   String host = settings.hostname;
   host.trim();
   host.toLowerCase();
   String clean;
   for (size_t i = 0; i < host.length() && clean.length() < 31; ++i) {
-    char c = host.charAt(i);
-    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+    char c = normalizedHostnameChar(host.charAt(i));
+    if (c != '\0') {
       clean += c;
-    } else if (c == '_' || c == ' ' || c == '.') {
-      clean += '-';
     }
   }
   clean.trim();
-  while (clean.startsWith("-")) {
-    clean.remove(0, 1);
-  }
-  while (clean.endsWith("-")) {
-    clean.remove(clean.length() - 1);
-  }
+  trimHostnameDashes(clean);
   if (clean.length() == 0) {
     clean = "tbeam-ntp";
   }
@@ -1131,7 +1350,55 @@ static void consumeGps() {
   }
 }
 
-static uint8_t chargeCurrentOption(uint16_t ma) {
+static const char *hardwareRevisionLabel() {
+  switch (hardwareRevision) {
+    case HardwareRevision::TBeamV11:
+      return "T-Beam v1.1";
+    case HardwareRevision::TBeamV12:
+      return "T-Beam v1.2";
+    default:
+      return "T-Beam unknown";
+  }
+}
+
+static const char *pmicModelLabel() {
+  switch (pmicModel) {
+    case PmicModel::Axp192:
+      return "AXP192";
+    case PmicModel::Axp2101:
+      return "AXP2101";
+    default:
+      return "none";
+  }
+}
+
+static bool readPmicRegister(uint8_t reg, uint8_t &value) {
+  Wire.beginTransmission(AXP192_SLAVE_ADDRESS);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+  if (Wire.requestFrom(static_cast<uint8_t>(AXP192_SLAVE_ADDRESS), static_cast<uint8_t>(1)) != 1) {
+    return false;
+  }
+  value = Wire.read();
+  return true;
+}
+
+static void rememberDetectedPmic(PmicModel model, uint8_t chipId) {
+  pmicModel = model;
+  pmicRegister03 = chipId;
+  pmicRegister03Valid = true;
+  if (model == PmicModel::Axp192) {
+    hardwareRevision = HardwareRevision::TBeamV11;
+    pmu = &pmu192;
+  } else if (model == PmicModel::Axp2101) {
+    hardwareRevision = HardwareRevision::TBeamV12;
+    pmu = &pmu2101;
+  }
+}
+
+static uint8_t chargeCurrentOptionAxp192(uint16_t ma) {
   struct CurrentMap {
     uint16_t ma;
     uint8_t opt;
@@ -1155,7 +1422,33 @@ static uint8_t chargeCurrentOption(uint16_t ma) {
   return selected;
 }
 
-static uint8_t chargeVoltageOption(uint16_t mv) {
+static uint8_t chargeCurrentOptionAxp2101(uint16_t ma) {
+  struct CurrentMap {
+    uint16_t ma;
+    uint8_t opt;
+  };
+  static const CurrentMap map[] = {
+      {100, XPOWERS_AXP2101_CHG_CUR_100MA},
+      {125, XPOWERS_AXP2101_CHG_CUR_125MA},
+      {150, XPOWERS_AXP2101_CHG_CUR_150MA},
+      {175, XPOWERS_AXP2101_CHG_CUR_175MA},
+      {200, XPOWERS_AXP2101_CHG_CUR_200MA},
+      {300, XPOWERS_AXP2101_CHG_CUR_300MA},
+      {400, XPOWERS_AXP2101_CHG_CUR_400MA},
+      {500, XPOWERS_AXP2101_CHG_CUR_500MA},
+      {600, XPOWERS_AXP2101_CHG_CUR_600MA},
+      {700, XPOWERS_AXP2101_CHG_CUR_700MA},
+  };
+  uint8_t selected = map[0].opt;
+  for (const CurrentMap &entry : map) {
+    if (ma >= entry.ma) {
+      selected = entry.opt;
+    }
+  }
+  return selected;
+}
+
+static uint8_t chargeVoltageOptionAxp192(uint16_t mv) {
   if (mv <= 4100) {
     return XPOWERS_AXP192_CHG_VOL_4V1;
   }
@@ -1163,6 +1456,16 @@ static uint8_t chargeVoltageOption(uint16_t mv) {
     return XPOWERS_AXP192_CHG_VOL_4V15;
   }
   return XPOWERS_AXP192_CHG_VOL_4V2;
+}
+
+static uint8_t chargeVoltageOptionAxp2101(uint16_t mv) {
+  if (mv <= 4000) {
+    return XPOWERS_AXP2101_CHG_VOL_4V;
+  }
+  if (mv <= 4100) {
+    return XPOWERS_AXP2101_CHG_VOL_4V1;
+  }
+  return XPOWERS_AXP2101_CHG_VOL_4V2;
 }
 
 static uint8_t powerOffOption(uint8_t seconds) {
@@ -1178,131 +1481,296 @@ static uint8_t powerOffOption(uint8_t seconds) {
   return XPOWERS_POWEROFF_10S;
 }
 
+static uint16_t normalizedSysPowerDownMv() {
+  uint16_t sysDown = settings.sysPowerDownMv;
+  sysDown = (sysDown / 100) * 100;
+  return clampU16(sysDown, 2600, 3300);
+}
+
+static void applyCommonPowerSettings() {
+  if (!pmu) {
+    return;
+  }
+  pmu->setSysPowerDownVoltage(normalizedSysPowerDownMv());
+  pmu->setPowerKeyPressOffTime(powerOffOption(settings.powerKeyOffSeconds));
+  pmu->setPowerKeyPressOnTime(XPOWERS_POWERON_128MS);
+}
+
+static void applyPowerSettingsAxp192() {
+  applyCommonPowerSettings();
+  pmu192.setVbusVoltageLimit(XPOWERS_AXP192_VBUS_VOL_LIM_4V5);
+  if (settings.vbusCurrentLimitMa == 100) {
+    pmu192.setVbusCurrentLimit(XPOWERS_AXP192_VBUS_CUR_LIM_100MA);
+  } else if (settings.vbusCurrentLimitMa == 0) {
+    pmu192.setVbusCurrentLimit(XPOWERS_AXP192_VBUS_CUR_LIM_OFF);
+  } else {
+    pmu192.setVbusCurrentLimit(XPOWERS_AXP192_VBUS_CUR_LIM_500MA);
+  }
+
+  pmu192.setChargerConstantCurr(chargeCurrentOptionAxp192(settings.chargeCurrentMa));
+  pmu192.setChargeTargetVoltage(chargeVoltageOptionAxp192(settings.chargeTargetMv));
+  pmu192.setChargerTerminationCurr(XPOWERS_AXP192_CHG_ITERM_LESS_10_PERCENT);
+
+  if (settings.chargeEnabled) {
+    pmu192.enableCharge();
+  } else {
+    pmu192.disableCharge();
+  }
+}
+
+static void applyPowerSettingsAxp2101() {
+  applyCommonPowerSettings();
+  pmu2101.setVbusVoltageLimit(XPOWERS_AXP2101_VBUS_VOL_LIM_4V52);
+  if (settings.vbusCurrentLimitMa == 100) {
+    pmu2101.setVbusCurrentLimit(XPOWERS_AXP2101_VBUS_CUR_LIM_100MA);
+  } else {
+    pmu2101.setVbusCurrentLimit(XPOWERS_AXP2101_VBUS_CUR_LIM_500MA);
+  }
+
+  pmu2101.setChargerConstantCurr(chargeCurrentOptionAxp2101(settings.chargeCurrentMa));
+  pmu2101.setChargeTargetVoltage(chargeVoltageOptionAxp2101(settings.chargeTargetMv));
+  pmu2101.setChargerTerminationCurr(XPOWERS_AXP2101_CHG_ITERM_25MA);
+  pmu2101.enableChargerTerminationLimit();
+
+  if (settings.chargeEnabled) {
+    pmu2101.enableCellbatteryCharge();
+  } else {
+    pmu2101.disableCellbatteryCharge();
+  }
+}
+
 static void applyPowerSettings() {
   if (!powerState.online) {
     return;
   }
 
-  uint16_t sysDown = settings.sysPowerDownMv;
-  sysDown = (sysDown / 100) * 100;
-  sysDown = clampU16(sysDown, 2600, 3300);
-
-  pmu.setSysPowerDownVoltage(sysDown);
-  pmu.setVbusVoltageLimit(XPOWERS_AXP192_VBUS_VOL_LIM_4V5);
-  if (settings.vbusCurrentLimitMa == 100) {
-    pmu.setVbusCurrentLimit(XPOWERS_AXP192_VBUS_CUR_LIM_100MA);
-  } else if (settings.vbusCurrentLimitMa == 0) {
-    pmu.setVbusCurrentLimit(XPOWERS_AXP192_VBUS_CUR_LIM_OFF);
-  } else {
-    pmu.setVbusCurrentLimit(XPOWERS_AXP192_VBUS_CUR_LIM_500MA);
+  if (pmicModel == PmicModel::Axp2101) {
+    applyPowerSettingsAxp2101();
+  } else if (pmicModel == PmicModel::Axp192) {
+    applyPowerSettingsAxp192();
   }
+}
 
-  pmu.setChargerConstantCurr(chargeCurrentOption(settings.chargeCurrentMa));
-  pmu.setChargeTargetVoltage(chargeVoltageOption(settings.chargeTargetMv));
-  pmu.setChargerTerminationCurr(XPOWERS_AXP192_CHG_ITERM_LESS_10_PERCENT);
+static void configureAxp192Rails() {
+  pmu192.setChargingLedMode(XPOWERS_CHG_LED_CTRL_CHG);
+  pmu192.disableTSPinMeasure();
+  pmu192.setProtectedChannel(XPOWERS_DCDC3);
+  pmu192.setProtectedChannel(XPOWERS_DCDC1);
+  pmu192.setDC1Voltage(3300);
+  pmu192.enableDC1();
+  pmu192.setLDO3Voltage(3300);
+  pmu192.enableLDO3();
+  pmu192.setLDO2Voltage(3300);
+  pmu192.disableLDO2();
+  pmu192.disableDC2();
+}
 
-  if (settings.chargeEnabled) {
-    pmu.enableCharge();
-  } else {
-    pmu.disableCharge();
+static void configureAxp2101Rails() {
+  pmu2101.setChargingLedMode(XPOWERS_CHG_LED_CTRL_CHG);
+  pmu2101.disableTSPinMeasure();
+  pmu2101.setProtectedChannel(XPOWERS_DCDC1);
+
+  pmu->disablePowerOutput(XPOWERS_DCDC2);
+  pmu->disablePowerOutput(XPOWERS_DCDC3);
+  pmu->disablePowerOutput(XPOWERS_DCDC4);
+  pmu->disablePowerOutput(XPOWERS_DCDC5);
+  pmu->disablePowerOutput(XPOWERS_ALDO1);
+  pmu->setPowerChannelVoltage(XPOWERS_ALDO2, 3300);
+  pmu->disablePowerOutput(XPOWERS_ALDO2);
+  pmu->setPowerChannelVoltage(XPOWERS_ALDO3, 3300);
+  pmu->enablePowerOutput(XPOWERS_ALDO3);
+  pmu->disablePowerOutput(XPOWERS_ALDO4);
+  pmu->disablePowerOutput(XPOWERS_BLDO1);
+  pmu->disablePowerOutput(XPOWERS_BLDO2);
+  pmu->disablePowerOutput(XPOWERS_DLDO1);
+  pmu->disablePowerOutput(XPOWERS_DLDO2);
+  pmu->disablePowerOutput(XPOWERS_CPULDO);
+  pmu->setPowerChannelVoltage(XPOWERS_VBACKUP, 3300);
+  pmu->enablePowerOutput(XPOWERS_VBACKUP);
+}
+
+static void enablePowerTelemetry() {
+  if (!pmu) {
+    return;
   }
+  pmu->enableBattDetection();
+  pmu->enableVbusVoltageMeasure();
+  pmu->enableBattVoltageMeasure();
+  pmu->enableSystemVoltageMeasure();
+  pmu->enableTemperatureMeasure();
+}
 
-  pmu.setPowerKeyPressOffTime(powerOffOption(settings.powerKeyOffSeconds));
-  pmu.setPowerKeyPressOnTime(XPOWERS_POWERON_128MS);
+static void configurePmuInterrupts() {
+  if (!pmu) {
+    return;
+  }
+  if (pmicModel == PmicModel::Axp2101) {
+    pmu2101.disableIRQ(XPOWERS_AXP2101_ALL_IRQ);
+    pmu2101.clearIrqStatus();
+    pmu2101.enableIRQ(XPOWERS_AXP2101_VBUS_REMOVE_IRQ |
+                      XPOWERS_AXP2101_VBUS_INSERT_IRQ |
+                      XPOWERS_AXP2101_BAT_CHG_DONE_IRQ |
+                      XPOWERS_AXP2101_BAT_CHG_START_IRQ |
+                      XPOWERS_AXP2101_BAT_REMOVE_IRQ |
+                      XPOWERS_AXP2101_BAT_INSERT_IRQ |
+                      XPOWERS_AXP2101_PKEY_SHORT_IRQ |
+                      XPOWERS_AXP2101_PKEY_LONG_IRQ);
+  } else {
+    pmu192.disableIRQ(XPOWERS_AXP192_ALL_IRQ);
+    pmu192.clearIrqStatus();
+    pmu192.enableIRQ(XPOWERS_AXP192_VBUS_REMOVE_IRQ |
+                     XPOWERS_AXP192_VBUS_INSERT_IRQ |
+                     XPOWERS_AXP192_BAT_CHG_DONE_IRQ |
+                     XPOWERS_AXP192_BAT_CHG_START_IRQ |
+                     XPOWERS_AXP192_BAT_REMOVE_IRQ |
+                     XPOWERS_AXP192_BAT_INSERT_IRQ |
+                     XPOWERS_AXP192_PKEY_SHORT_IRQ |
+                     XPOWERS_AXP192_PKEY_LONG_IRQ);
+  }
+}
+
+static bool beginDetectedPmic(PmicModel model) {
+  if (model == PmicModel::Axp2101 &&
+      pmu2101.begin(Wire, AXP2101_SLAVE_ADDRESS, PIN_I2C_SDA, PIN_I2C_SCL)) {
+    rememberDetectedPmic(PmicModel::Axp2101, pmu2101.getChipID());
+    configureAxp2101Rails();
+    return true;
+  }
+  if (model == PmicModel::Axp192 &&
+      pmu192.begin(Wire, AXP192_SLAVE_ADDRESS, PIN_I2C_SDA, PIN_I2C_SCL)) {
+    rememberDetectedPmic(PmicModel::Axp192, pmu192.getChipID());
+    configureAxp192Rails();
+    return true;
+  }
+  return false;
 }
 
 static void beginPower() {
-  powerState.online = pmu.begin(Wire, AXP192_SLAVE_ADDRESS, PIN_I2C_SDA, PIN_I2C_SCL);
+  uint8_t reg03 = 0;
+  if (readPmicRegister(XPOWERS_AXP192_IC_TYPE, reg03)) {
+    pmicRegister03 = reg03;
+    pmicRegister03Valid = true;
+    if (reg03 == XPOWERS_AXP2101_CHIP_ID) {
+      powerState.online = beginDetectedPmic(PmicModel::Axp2101);
+    } else if (reg03 == XPOWERS_AXP192_CHIP_ID) {
+      powerState.online = beginDetectedPmic(PmicModel::Axp192);
+    }
+  }
+
   if (!powerState.online) {
-    Serial.println("AXP192 PMU not detected; continuing without battery telemetry");
+    powerState.online = beginDetectedPmic(PmicModel::Axp2101) ||
+                        beginDetectedPmic(PmicModel::Axp192);
+  }
+
+  if (!powerState.online) {
+    pmu = nullptr;
+    pmicModel = PmicModel::None;
+    hardwareRevision = HardwareRevision::Unknown;
+    Serial.println("PMU not detected; continuing without battery telemetry");
     return;
   }
 
-  Serial.printf("AXP192 PMU online, chip ID 0x%02X\n", pmu.getChipID());
-  pmu.setChargingLedMode(XPOWERS_CHG_LED_CTRL_CHG);
-  pmu.disableTSPinMeasure();
-
-  pmu.setProtectedChannel(XPOWERS_DCDC3);
-  pmu.setProtectedChannel(XPOWERS_DCDC1);
-
-  pmu.setDC1Voltage(3300);
-  pmu.enableDC1();
-
-  pmu.setLDO3Voltage(3300);
-  pmu.enableLDO3();
-
-  pmu.setLDO2Voltage(3300);
-  pmu.disableLDO2();
-  pmu.disableDC2();
-
-  pmu.enableBattDetection();
-  pmu.enableVbusVoltageMeasure();
-  pmu.enableBattVoltageMeasure();
-  pmu.enableSystemVoltageMeasure();
-
-  pmu.disableIRQ(XPOWERS_AXP192_ALL_IRQ);
-  pmu.clearIrqStatus();
-  pmu.enableIRQ(XPOWERS_AXP192_VBUS_REMOVE_IRQ |
-                XPOWERS_AXP192_VBUS_INSERT_IRQ |
-                XPOWERS_AXP192_BAT_CHG_DONE_IRQ |
-                XPOWERS_AXP192_BAT_CHG_START_IRQ |
-                XPOWERS_AXP192_BAT_REMOVE_IRQ |
-                XPOWERS_AXP192_BAT_INSERT_IRQ |
-                XPOWERS_AXP192_PKEY_SHORT_IRQ |
-                XPOWERS_AXP192_PKEY_LONG_IRQ);
-
+  Serial.printf("%s %s PMU online, register 0x03 = 0x%02X\n",
+                hardwareRevisionLabel(), pmicModelLabel(), pmicRegister03);
+  enablePowerTelemetry();
+  configurePmuInterrupts();
   pinMode(PIN_PMU_IRQ, INPUT);
   attachInterrupt(PIN_PMU_IRQ, onPmuIrq, FALLING);
   applyPowerSettings();
 }
 
+static bool powerPollDue() {
+  return powerState.online && millis() - lastPowerPollMs >= POWER_POLL_INTERVAL_MS;
+}
+
+static float measuredBatteryCurrentMa() {
+  if (pmicModel != PmicModel::Axp192) {
+    return 0.0f;
+  }
+  if (powerState.charging) {
+    return pmu192.getBatteryChargeCurrent();
+  }
+  if (powerState.discharging) {
+    return -pmu192.getBattDischargeCurrent();
+  }
+  return 0.0f;
+}
+
+static float measuredVbusCurrentMa() {
+  if (pmicModel == PmicModel::Axp192) {
+    return pmu192.getVbusCurrent();
+  }
+  return 0.0f;
+}
+
+static float measuredPmuTemperatureC() {
+  if (pmicModel == PmicModel::Axp2101) {
+    return pmu2101.getTemperature();
+  }
+  if (pmicModel == PmicModel::Axp192) {
+    return pmu192.getTemperature();
+  }
+  return 0.0f;
+}
+
+static void samplePowerTelemetry() {
+  if (!pmu) {
+    return;
+  }
+  powerState.batteryPresent = pmu->isBatteryConnect();
+  powerState.charging = powerState.batteryPresent && pmu->isCharging();
+  powerState.discharging = powerState.batteryPresent && pmu->isDischarge();
+  powerState.vbusPresent = pmu->isVbusIn();
+  powerState.batteryMv = pmu->getBattVoltage();
+  powerState.vbusMv = pmu->getVbusVoltage();
+  powerState.vbusCurrentMa = measuredVbusCurrentMa();
+  powerState.systemMv = pmu->getSystemVoltage();
+  powerState.temperatureC = measuredPmuTemperatureC();
+  powerState.batteryPercent = powerState.batteryPresent ? pmu->getBatteryPercent() : -1;
+  powerState.batteryCurrentMa = measuredBatteryCurrentMa();
+}
+
+static bool batteryDischargingBelow(uint16_t thresholdMv) {
+  return powerState.batteryPresent && powerState.discharging &&
+         powerState.batteryMv > 0 && powerState.batteryMv <= thresholdMv;
+}
+
+static void updatePowerWarning(bool wasWarning) {
+  powerState.warning = batteryDischargingBelow(settings.warningVoltageMv);
+  if (powerState.warning && !wasWarning) {
+    wakeOledForPowerWarning();
+  }
+}
+
+static void updatePowerCutoff() {
+  if (!batteryDischargingBelow(settings.cutoffVoltageMv)) {
+    lowBatterySinceMs = 0;
+    powerState.cutoffPending = false;
+    return;
+  }
+
+  if (lowBatterySinceMs == 0) {
+    lowBatterySinceMs = millis();
+  }
+  powerState.cutoffPending = true;
+  if (millis() - lowBatterySinceMs > BATTERY_CUTOFF_DEBOUNCE_MS) {
+    Serial.println("Battery below cutoff while discharging; requesting PMU shutdown");
+    if (pmu) {
+      pmu->shutdown();
+    }
+  }
+}
+
 static void pollPower() {
-  if (!powerState.online || millis() - lastPowerPollMs < 1000) {
+  if (!powerPollDue()) {
     return;
   }
   lastPowerPollMs = millis();
   bool wasWarning = powerState.warning;
 
-  powerState.batteryPresent = pmu.isBatteryConnect();
-  powerState.charging = powerState.batteryPresent && pmu.isCharging();
-  powerState.discharging = powerState.batteryPresent && pmu.isDischarge();
-  powerState.vbusPresent = pmu.isVbusIn();
-  powerState.batteryMv = pmu.getBattVoltage();
-  powerState.vbusMv = pmu.getVbusVoltage();
-  powerState.vbusCurrentMa = pmu.getVbusCurrent();
-  powerState.systemMv = pmu.getSystemVoltage();
-  powerState.temperatureC = pmu.getTemperature();
-  powerState.batteryPercent = powerState.batteryPresent ? pmu.getBatteryPercent() : -1;
-
-  if (powerState.charging) {
-    powerState.batteryCurrentMa = pmu.getBatteryChargeCurrent();
-  } else if (powerState.discharging) {
-    powerState.batteryCurrentMa = -pmu.getBattDischargeCurrent();
-  } else {
-    powerState.batteryCurrentMa = 0.0f;
-  }
-
-  powerState.warning = powerState.batteryPresent && powerState.discharging &&
-                       powerState.batteryMv > 0 && powerState.batteryMv <= settings.warningVoltageMv;
-  if (powerState.warning && !wasWarning) {
-    wakeOledForPowerWarning();
-  }
-
-  bool belowCutoff = powerState.batteryPresent && powerState.discharging &&
-                     powerState.batteryMv > 0 && powerState.batteryMv <= settings.cutoffVoltageMv;
-  if (belowCutoff) {
-    if (lowBatterySinceMs == 0) {
-      lowBatterySinceMs = millis();
-    }
-    powerState.cutoffPending = true;
-    if (millis() - lowBatterySinceMs > 30000) {
-      Serial.println("Battery below cutoff while discharging; requesting PMU shutdown");
-      pmu.shutdown();
-    }
-  } else {
-    lowBatterySinceMs = 0;
-    powerState.cutoffPending = false;
-  }
+  samplePowerTelemetry();
+  updatePowerWarning(wasWarning);
+  updatePowerCutoff();
 }
 
 static bool beforeDeadline(uint32_t deadlineMs) {
@@ -1319,8 +1787,8 @@ static void handlePmuIrq() {
     return;
   }
   pmuIrqPending = false;
-  pmu.getIrqStatus();
-  if (pmu.isPekeyShortPressIrq()) {
+  pmu->getIrqStatus();
+  if (pmu->isPekeyShortPressIrq()) {
     bool wokeDisplay = oledSleeping;
     wakeOled();
     if (!wokeDisplay) {
@@ -1330,7 +1798,7 @@ static void handlePmuIrq() {
     lastOledActivityMs = millis();
     lastOledUpdateMs = 0;
   }
-  pmu.clearIrqStatus();
+  pmu->clearIrqStatus();
 }
 
 static void scanI2c() {
@@ -1417,6 +1885,94 @@ static bool readDnsName(const uint8_t *packet, size_t len, size_t &offset, Strin
   return false;
 }
 
+struct DnsQuestion {
+  String name;
+  uint16_t type;
+  uint16_t qclass;
+  size_t endOffset;
+};
+
+static bool readDnsQuestion(const uint8_t *packet, size_t len, DnsQuestion &question) {
+  size_t offset = DNS_HEADER_SIZE;
+  if (!readDnsName(packet, len, offset, question.name) || offset + 4 > len) {
+    return false;
+  }
+
+  question.type = (packet[offset] << 8) | packet[offset + 1];
+  question.qclass = (packet[offset + 2] << 8) | packet[offset + 3];
+  question.endOffset = offset + 4;
+  return true;
+}
+
+static bool shouldAnswerDnsQuestion(const DnsQuestion &question, bool &aliasHit) {
+  return question.type == 1 && question.qclass == 1 && shouldAnswerDns(question.name, aliasHit);
+}
+
+static void writeDnsResponseHeader(uint8_t *response, const uint8_t *request, size_t questionEnd, bool answer) {
+  memcpy(response, request, questionEnd);
+  response[2] = 0x81;
+  response[3] = answer ? 0x80 : 0x83;
+  response[4] = 0x00;
+  response[5] = 0x01;
+  response[6] = 0x00;
+  response[7] = answer ? 0x01 : 0x00;
+  response[8] = response[9] = response[10] = response[11] = 0x00;
+}
+
+static size_t appendDnsARecord(uint8_t *response, size_t responseLen, size_t responseCapacity) {
+  if (responseLen + 16 > responseCapacity) {
+    return responseLen;
+  }
+
+  response[responseLen++] = 0xC0;
+  response[responseLen++] = 0x0C;
+  response[responseLen++] = 0x00;
+  response[responseLen++] = 0x01;
+  response[responseLen++] = 0x00;
+  response[responseLen++] = 0x01;
+  response[responseLen++] = 0x00;
+  response[responseLen++] = 0x00;
+  response[responseLen++] = 0x00;
+  response[responseLen++] = 0x3C;
+  response[responseLen++] = 0x00;
+  response[responseLen++] = 0x04;
+  response[responseLen++] = settings.apIp[0];
+  response[responseLen++] = settings.apIp[1];
+  response[responseLen++] = settings.apIp[2];
+  response[responseLen++] = settings.apIp[3];
+  return responseLen;
+}
+
+static void sendDnsResponse(const uint8_t *response, size_t responseLen) {
+  dnsUdp.beginPacket(dnsUdp.remoteIP(), dnsUdp.remotePort());
+  dnsUdp.write(response, responseLen);
+  dnsUdp.endPacket();
+}
+
+static void handleDnsPacket(const uint8_t *packet, size_t len) {
+  if (len < DNS_HEADER_SIZE) {
+    return;
+  }
+  dnsQueryCount++;
+
+  DnsQuestion question;
+  if (!readDnsQuestion(packet, len, question)) {
+    return;
+  }
+
+  bool aliasHit = false;
+  bool answer = shouldAnswerDnsQuestion(question, aliasHit);
+  if (aliasHit) {
+    dnsAliasHitCount++;
+  }
+
+  uint8_t response[DNS_RESPONSE_MAX_SIZE];
+  memset(response, 0, sizeof(response));
+  writeDnsResponseHeader(response, packet, question.endOffset, answer);
+  size_t responseLen = answer ? appendDnsARecord(response, question.endOffset, sizeof(response)) : question.endOffset;
+  sendDnsResponse(response, responseLen);
+}
+
 static void processDns() {
   if (!dnsOnline) {
     return;
@@ -1427,64 +1983,9 @@ static void processDns() {
       return;
     }
 
-    uint8_t packet[512];
+    uint8_t packet[DNS_PACKET_MAX_SIZE];
     int len = dnsUdp.read(packet, sizeof(packet));
-    if (len < 12) {
-      continue;
-    }
-    dnsQueryCount++;
-
-    size_t offset = 12;
-    String qname;
-    bool validName = readDnsName(packet, len, offset, qname);
-    if (!validName || offset + 4 > static_cast<size_t>(len)) {
-      continue;
-    }
-    uint16_t qtype = (packet[offset] << 8) | packet[offset + 1];
-    uint16_t qclass = (packet[offset + 2] << 8) | packet[offset + 3];
-    offset += 4;
-    size_t questionEnd = offset;
-
-    bool aliasHit = false;
-    bool answer = qtype == 1 && qclass == 1 && shouldAnswerDns(qname, aliasHit);
-    if (aliasHit) {
-      dnsAliasHitCount++;
-    }
-
-    uint8_t response[576];
-    memset(response, 0, sizeof(response));
-    memcpy(response, packet, questionEnd);
-    response[2] = 0x81;
-    response[3] = answer ? 0x80 : 0x83;
-    response[4] = 0x00;
-    response[5] = 0x01;
-    response[6] = 0x00;
-    response[7] = answer ? 0x01 : 0x00;
-    response[8] = response[9] = response[10] = response[11] = 0x00;
-
-    size_t responseLen = questionEnd;
-    if (answer && responseLen + 16 <= sizeof(response)) {
-      response[responseLen++] = 0xC0;
-      response[responseLen++] = 0x0C;
-      response[responseLen++] = 0x00;
-      response[responseLen++] = 0x01;
-      response[responseLen++] = 0x00;
-      response[responseLen++] = 0x01;
-      response[responseLen++] = 0x00;
-      response[responseLen++] = 0x00;
-      response[responseLen++] = 0x00;
-      response[responseLen++] = 0x3C;
-      response[responseLen++] = 0x00;
-      response[responseLen++] = 0x04;
-      response[responseLen++] = settings.apIp[0];
-      response[responseLen++] = settings.apIp[1];
-      response[responseLen++] = settings.apIp[2];
-      response[responseLen++] = settings.apIp[3];
-    }
-
-    dnsUdp.beginPacket(dnsUdp.remoteIP(), dnsUdp.remotePort());
-    dnsUdp.write(response, responseLen);
-    dnsUdp.endPacket();
+    handleDnsPacket(packet, len > 0 ? static_cast<size_t>(len) : 0);
   }
 }
 
@@ -1511,6 +2012,75 @@ static void encodeNtpShort(uint8_t *out, float seconds) {
   out[3] = value;
 }
 
+static int readNtpRequest(uint8_t *request, size_t requestSize) {
+  memset(request, 0, requestSize);
+  int len = ntpUdp.read(request, requestSize);
+  while (ntpUdp.available()) {
+    ntpUdp.read();
+  }
+  return len;
+}
+
+static bool ntpServingClockHealthy(uint64_t &recvUsec) {
+  bool synced = getClockUnixUsec(recvUsec);
+  // Fail closed: PPS can maintain phase briefly, but fresh NMEA proves the GPS
+  // receiver is still reporting valid absolute UTC rather than stale holdover.
+  return synced && hasFreshGpsTime();
+}
+
+static uint8_t sanitizedNtpVersion(const uint8_t *request) {
+  uint8_t version = (request[0] >> 3) & 0x07;
+  return version < 3 || version > 4 ? 4 : version;
+}
+
+static void buildNtpResponse(const uint8_t *request, uint8_t *response, uint64_t recvUsec) {
+  memset(response, 0, NTP_PACKET_SIZE);
+  bool ppsLocked = hasRecentPps();
+  response[0] = (0 << 6) | (sanitizedNtpVersion(request) << 3) | 4;
+  response[1] = 1;
+  response[2] = request[2] ? request[2] : 6;
+  response[3] = ppsLocked ? static_cast<uint8_t>(-20) : static_cast<uint8_t>(-10);
+  encodeNtpShort(response + 4, 0.0f);
+  encodeNtpShort(response + 8, ppsLocked ? 0.001f : 0.250f);
+  response[12] = 'G';
+  response[13] = 'P';
+  response[14] = 'S';
+  response[15] = ppsLocked ? 0x00 : 'N';
+  memcpy(response + 24, request + 40, 8);
+
+  uint64_t refUsec = static_cast<uint64_t>(clockAnchorEpoch) * 1000000ULL;
+  uint64_t txUsec = recvUsec;
+  getClockUnixUsec(txUsec);
+  encodeNtpTimestamp(response + 16, refUsec);
+  encodeNtpTimestamp(response + 32, recvUsec);
+  encodeNtpTimestamp(response + 40, txUsec);
+}
+
+static void sendNtpResponse(const uint8_t *response, size_t responseSize) {
+  ntpUdp.beginPacket(ntpUdp.remoteIP(), ntpUdp.remotePort());
+  ntpUdp.write(response, responseSize);
+  ntpUdp.endPacket();
+}
+
+static void handleNtpPacket() {
+  uint8_t request[NTP_PACKET_SIZE];
+  if (readNtpRequest(request, sizeof(request)) < static_cast<int>(NTP_PACKET_SIZE)) {
+    return;
+  }
+
+  ntpRequestCount++;
+  uint64_t recvUsec = 0;
+  if (!ntpServingClockHealthy(recvUsec)) {
+    ntpSuppressedCount++;
+    return;
+  }
+
+  uint8_t response[NTP_PACKET_SIZE];
+  buildNtpResponse(request, response, recvUsec);
+  sendNtpResponse(response, sizeof(response));
+  ntpResponseCount++;
+}
+
 static void processNtp() {
   if (!ntpOnline) {
     return;
@@ -1521,56 +2091,7 @@ static void processNtp() {
       return;
     }
 
-    uint8_t request[48];
-    memset(request, 0, sizeof(request));
-    int len = ntpUdp.read(request, sizeof(request));
-    while (ntpUdp.available()) {
-      ntpUdp.read();
-    }
-    if (len < 48) {
-      continue;
-    }
-
-    ntpRequestCount++;
-    uint64_t recvUsec = 0;
-    bool synced = getClockUnixUsec(recvUsec);
-    // Fail closed: PPS can maintain phase briefly, but fresh NMEA proves the GPS
-    // receiver is still reporting valid absolute UTC rather than stale holdover.
-    bool healthy = synced && hasFreshGpsTime();
-    if (!healthy) {
-      ntpSuppressedCount++;
-      continue;
-    }
-
-    uint8_t response[48];
-    memset(response, 0, sizeof(response));
-    uint8_t version = (request[0] >> 3) & 0x07;
-    if (version < 3 || version > 4) {
-      version = 4;
-    }
-    bool ppsLocked = hasRecentPps();
-    response[0] = (0 << 6) | (version << 3) | 4;
-    response[1] = 1;
-    response[2] = request[2] ? request[2] : 6;
-    response[3] = ppsLocked ? static_cast<uint8_t>(-20) : static_cast<uint8_t>(-10);
-    encodeNtpShort(response + 4, 0.0f);
-    encodeNtpShort(response + 8, ppsLocked ? 0.001f : 0.250f);
-    response[12] = 'G';
-    response[13] = 'P';
-    response[14] = 'S';
-    response[15] = ppsLocked ? 0x00 : 'N';
-    memcpy(response + 24, request + 40, 8);
-
-    uint64_t refUsec = static_cast<uint64_t>(clockAnchorEpoch) * 1000000ULL;
-    uint64_t txUsec = recvUsec;
-    getClockUnixUsec(txUsec);
-    encodeNtpTimestamp(response + 16, refUsec);
-    encodeNtpTimestamp(response + 32, recvUsec);
-    encodeNtpTimestamp(response + 40, txUsec);
-
-    ntpUdp.beginPacket(ntpUdp.remoteIP(), ntpUdp.remotePort());
-    ntpUdp.write(response, sizeof(response));
-    ntpUdp.endPacket();
+    handleNtpPacket();
   }
 }
 
@@ -1623,35 +2144,64 @@ static void startNtp() {
   }
 }
 
-static bool startConfiguredSoftAp(const String &ssid) {
-  bool openAp = settings.apSecurityMode == ApSecurityMode::Open;
-  String password = settings.apPassword;
-  if (!openAp && password.length() < 8) {
-    password = DEFAULT_AP_PASSWORD;
-  }
+static bool softApIsOpen() {
+  return settings.apSecurityMode == ApSecurityMode::Open;
+}
 
-  bool ok = WiFi.softAP(ssid.c_str(), openAp ? nullptr : password.c_str(), settings.apChannel, 0, settings.apMaxClients);
-  if (!ok || openAp || settings.apSecurityMode == ApSecurityMode::Wpa2) {
-    return ok;
+static String effectiveSoftApPassword() {
+  if (softApIsOpen()) {
+    return "";
   }
+  return strlen(settings.apPassword) >= 8 ? String(settings.apPassword) : String(DEFAULT_AP_PASSWORD);
+}
 
-  wifi_config_t conf;
+static bool softApNeedsSecurityOverride() {
+  return settings.apSecurityMode != ApSecurityMode::Open &&
+         settings.apSecurityMode != ApSecurityMode::Wpa2;
+}
+
+static wifi_cipher_type_t softApPairwiseCipher() {
+  return settings.apSecurityMode == ApSecurityMode::WpaWpa2
+             ? WIFI_CIPHER_TYPE_TKIP_CCMP
+             : WIFI_CIPHER_TYPE_CCMP;
+}
+
+static bool readSoftApConfig(wifi_config_t &conf) {
   esp_err_t err = esp_wifi_get_config(WIFI_IF_AP, &conf);
-  if (err != ESP_OK) {
-    Serial.printf("AP security read failed: %d\n", err);
+  if (err == ESP_OK) {
+    return true;
+  }
+  Serial.printf("AP security read failed: %d\n", err);
+  return false;
+}
+
+static bool applySoftApSecurityOverride() {
+  wifi_config_t conf;
+  if (!readSoftApConfig(conf)) {
     return false;
   }
 
   conf.ap.authmode = apWifiAuthMode(settings.apSecurityMode);
-  conf.ap.pairwise_cipher = settings.apSecurityMode == ApSecurityMode::WpaWpa2
-                                ? WIFI_CIPHER_TYPE_TKIP_CCMP
-                                : WIFI_CIPHER_TYPE_CCMP;
-  err = esp_wifi_set_config(WIFI_IF_AP, &conf);
+  conf.ap.pairwise_cipher = softApPairwiseCipher();
+  esp_err_t err = esp_wifi_set_config(WIFI_IF_AP, &conf);
   if (err != ESP_OK) {
     Serial.printf("AP security mode %s failed: %d\n", apSecurityModeName(settings.apSecurityMode), err);
     return false;
   }
   return true;
+}
+
+static bool startConfiguredSoftAp(const String &ssid) {
+  bool openAp = softApIsOpen();
+  String password = effectiveSoftApPassword();
+  bool ok = WiFi.softAP(ssid.c_str(), openAp ? nullptr : password.c_str(), settings.apChannel, 0, settings.apMaxClients);
+  if (!ok) {
+    return false;
+  }
+  if (!softApNeedsSecurityOverride()) {
+    return true;
+  }
+  return applySoftApSecurityOverride();
 }
 
 static void startApMode() {
@@ -1731,217 +2281,82 @@ static String gpsDopString() {
   return "";
 }
 
-static const char INDEX_HTML[] PROGMEM = R"HTML(
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>T-Beam NTP Server</title>
-<style>
-:root{color-scheme:light;--bg:#f6f7f9;--ink:#17202a;--muted:#5d6875;--line:#d8dde5;--panel:#fff;--accent:#0f766e;--accent2:#1d4ed8;--warn:#b45309;--bad:#b91c1c}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.35 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
-header{background:#101820;color:#fff;padding:18px 20px}header h1{font-size:20px;margin:0 0 4px}header .meta{color:#b8c2cc}
-main{max-width:1120px;margin:0 auto;padding:18px;display:grid;gap:14px}
-section,details.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}
-details.panel>summary{cursor:pointer;font-weight:800;font-size:15px;margin:-2px 0 12px;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:12px}details.panel>summary::after{content:"\25BE";color:var(--muted);font-size:13px;line-height:1}details.panel[open]>summary::after{content:"\25B4"}details.panel>summary::-webkit-details-marker{display:none}details.panel:not([open])>summary{margin-bottom:0}
-.status-panel{background:#f7fbff}.network-panel{background:#f4fbf7}.ap-panel{background:#fffaf0}.timezone-panel{background:#f6f0ff}.display-panel{background:#f0f8ff}.power-panel{background:#fff4f6}.actions-panel{background:#f3fbf6}
-h2{font-size:15px;margin:0 0 12px}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:10px 12px}.span3{grid-column:span 3}.span4{grid-column:span 4}.span6{grid-column:span 6}.span8{grid-column:span 8}.span12{grid-column:span 12}
-label{display:block;font-weight:650;margin-bottom:4px}input,select,textarea,button{width:100%;font:inherit;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);padding:9px 10px}textarea{min-height:160px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
-input[type=checkbox]{width:auto;margin-right:8px}.check{display:flex;align-items:center;min-height:39px;color:var(--ink);font-weight:650}.actions{display:flex;gap:10px;flex-wrap:wrap}.actions button{width:auto;min-width:120px}
-.radio-row{display:flex;gap:14px;flex-wrap:wrap;align-items:center;min-height:39px}.radio-row label{display:flex;gap:6px;align-items:center;margin:0;font-weight:650}.radio-row input{width:auto;margin:0}
-.offset-row{display:grid;grid-template-columns:140px 1fr 1fr;gap:10px;align-items:end}.time-mode-body.hidden{display:none}.battery-strip{display:flex;align-items:center;gap:12px;min-height:42px}.battery-shell{width:58px;height:24px;border:2px solid var(--line);border-radius:5px;position:relative;background:#fff}.battery-shell::after{content:"";position:absolute;right:-7px;top:6px;width:5px;height:10px;background:var(--line);border-radius:0 2px 2px 0}.battery-fill{height:100%;width:0;border-radius:2px;background:var(--accent);transition:width .2s}.battery-fill.warn{background:var(--warn)}.battery-fill.bad{background:var(--bad)}.battery-meta{display:flex;gap:8px;flex-wrap:wrap;align-items:baseline}.battery-meta strong{font-size:16px}.power-indicator{font-weight:800}.status-battery-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.status-battery-row .battery-shell{flex:0 0 auto}.status-battery-percent{font-size:16px;font-weight:800}.status-battery-state{font-size:14px;font-weight:800;white-space:nowrap}.charge-bolt{color:#f97316;font-size:17px;font-weight:900;line-height:1}
-button{background:#e8eef6;cursor:pointer;font-weight:700}button.primary{background:var(--accent);border-color:var(--accent);color:#fff}button.secondary{background:#eaf0ff;border-color:#c6d4ff;color:#173b87}button.danger{background:#fff0f0;border-color:#ffc7c7;color:var(--bad)}
-.status{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.metric{border:1px solid var(--line);border-radius:8px;padding:10px;background:#fbfcfd}.metric b{display:block;font-size:12px;color:var(--muted);margin-bottom:3px}.metric span{font-size:15px}
-.ok{color:var(--accent)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted,.hint{color:var(--muted);font-size:12px}.hint{margin-top:5px;line-height:1.3}.hidden{display:none}
-@media(max-width:820px){.grid{grid-template-columns:1fr}.span3,.span4,.span6,.span8,.span12{grid-column:span 1}.status{grid-template-columns:1fr 1fr}.actions button{width:100%}.offset-row{grid-template-columns:1fr 1fr 1fr}}
-</style>
-</head>
-<body>
-<header><h1 title="GPS/PPS disciplined NTP server status and configuration">T-Beam NTP Server</h1><div class="meta" id="topline">Loading</div></header>
-<main>
-<details class="panel status-panel" open><summary title="Live clock, GPS, network, power, and memory state">Status</summary><div class="status" id="status"></div></details>
-<details class="panel network-panel"><summary title="Settings used when the T-Beam joins an existing WiFi network">Network Client</summary><div class="grid">
-<div class="span12"><label>Network mode</label><div class="radio-row"><label for="networkModeAp"><input name="networkMode" id="networkModeAp" type="radio" value="standaloneAp">Standalone AP Mode</label><label for="networkModeClient"><input name="networkMode" id="networkModeClient" type="radio" value="clientWithApFallback">Client Mode with AP Fallback</label></div></div>
-<div class="span6"><label for="staSsid">Network Client SSID</label><input id="staSsid" maxlength="32" placeholder="Type SSID or choose a scan result"></div>
-<div class="span3"><label for="staPass">Network Client Password</label><input id="staPass" type="password" maxlength="64"></div>
-<div class="span3"><label>&nbsp;</label><button class="secondary" id="scanBtn" type="button">Scan</button></div>
-<div class="span12"><label for="scanSelect">Scan results</label><select id="scanSelect" disabled><option value="">Scan to find networks</option></select></div>
-<div class="span4"><label for="hostname">Hostname</label><input id="hostname" maxlength="31"></div>
-<div class="span4 check"><input id="staDhcp" type="checkbox">Use DHCP</div>
-<div class="span4"><label for="connectTimeout">Connect timeout seconds</label><input id="connectTimeout" type="number" min="5" max="90"></div>
-<div class="span3"><label for="staticIp">Static IP</label><input id="staticIp"></div>
-<div class="span3"><label for="gateway">Gateway</label><input id="gateway"></div>
-<div class="span3"><label for="subnet">Subnet</label><input id="subnet"></div>
-<div class="span3"><label for="dns1">DNS 1</label><input id="dns1"></div>
-</div></details>
-<details class="panel ap-panel"><summary title="Settings used when the T-Beam is its own off-grid WiFi network">Standalone AP</summary><div class="grid">
-<div class="span4"><label for="apSsid">AP SSID</label><input id="apSsid" maxlength="32" aria-describedby="apSsidNote"><div class="hint" id="apSsidNote">Use {mac} to insert this unit's last six MAC hex digits.</div></div>
-<div class="span4"><label for="apPass">AP password</label><input id="apPass" type="password" maxlength="64"></div>
-<div class="span4"><label for="apSecurity">AP security</label><select id="apSecurity"><option value="wpa2">WPA2-Personal</option><option value="wpa2-wpa3">WPA2/WPA3-Personal</option><option value="wpa3">WPA3-Personal</option><option value="wpa-wpa2">WPA/WPA2-Personal legacy</option><option value="open">Open</option></select></div>
-<div class="span2"><label for="apChannel">Channel</label><input id="apChannel" type="number" min="1" max="13"></div>
-<div class="span2"><label for="apMax">Max clients</label><input id="apMax" type="number" min="1" max="10"></div>
-<div class="span3"><label for="apIp">AP IP</label><input id="apIp"></div>
-<div class="span3"><label for="apSubnet">AP subnet</label><input id="apSubnet"></div>
-<div class="span3 check"><input id="opt42" type="checkbox">DHCP option 42</div>
-<div class="span3 check"><input id="dnsAliases" type="checkbox">DNS NTP aliases</div>
-<div class="span3 check"><input id="dnsWildcard" type="checkbox">Captive DNS wildcard</div>
-<div class="span12"><label for="ntpHosts">NTP host aliases</label><textarea id="ntpHosts" spellcheck="false"></textarea></div>
-</div></details>
-<details class="panel timezone-panel"><summary title="Local display timezone settings">Local Time Zone</summary><div class="grid">
-<div class="span12"><label>Local time mode</label><div class="radio-row"><label for="timeModeOffset"><input name="timeMode" id="timeModeOffset" type="radio" value="offset">UTC offset</label><label for="timeModeIana"><input name="timeMode" id="timeModeIana" type="radio" value="iana">Time zone</label><label for="timeModePosix"><input name="timeMode" id="timeModePosix" type="radio" value="posix">POSIX rule</label></div></div>
-<div class="span12 time-mode-body" data-time-mode="offset" id="offsetModeFields"><div class="offset-row"><div><label for="offsetSign">Offset sign</label><select id="offsetSign"><option value="1">UTC+</option><option value="-1">UTC-</option></select></div><div><label for="offsetHours">Offset hours</label><input id="offsetHours" type="number" min="0" max="14"></div><div><label for="offsetMinutes">Offset minutes</label><input id="offsetMinutes" type="number" min="0" max="59"></div></div></div>
-<div class="span6 time-mode-body" data-time-mode="iana" id="ianaModeFields"><label for="ianaTimeZone">Time zone</label><select id="ianaTimeZone"><option value="">Loading timezone file</option></select></div>
-<div class="span6 time-mode-body" data-time-mode="posix" id="posixModeFields"><label for="posixTimezone">POSIX TZ rule</label><input id="posixTimezone" maxlength="95"></div>
-<input id="manualOffset" type="hidden"><input id="observeDst" type="hidden"><input id="autoOffset" type="hidden">
-</div></details>
-<details class="panel display-panel"><summary title="OLED display behavior">Display</summary><div class="grid">
-<div class="span3 check"><input id="oledCycle" type="checkbox">Cycle OLED screens</div>
-<div class="span3"><label for="oledCycleSeconds">OLED cycle seconds</label><input id="oledCycleSeconds" type="number" min="2" max="60"></div>
-<div class="span3"><label for="screenTimeout">Screensaver seconds</label><input id="screenTimeout" type="number" min="0" max="3600"></div>
-</div></details>
-<details class="panel power-panel"><summary title="AXP192 battery and USB power settings">Power</summary><div class="grid">
-<div class="span12 battery-strip" id="batteryMeter"><div class="battery-shell"><div class="battery-fill" id="batteryFill"></div></div><div class="battery-meta"><strong id="batteryPct">--</strong><span class="power-indicator" id="batteryState">Waiting for power data</span><span class="muted" id="batteryDetails"></span></div></div>
-<div class="span3 check"><input id="chargeEnabled" type="checkbox">Charging enabled</div>
-<div class="span3"><label for="chargeCurrent">Charge current mA</label><select id="chargeCurrent"><option>100</option><option>190</option><option selected>280</option><option>360</option><option>450</option><option>550</option><option>630</option><option>700</option></select></div>
-<div class="span3"><label for="chargeVoltage">Charge target mV</label><select id="chargeVoltage"><option>4100</option><option>4150</option><option>4200</option></select></div>
-<div class="span3"><label for="vbusLimit">VBUS limit mA</label><select id="vbusLimit"><option value="100">100</option><option value="500">500</option><option value="0">Off</option></select></div>
-<div class="span3"><label for="warnVoltage">Warning mV</label><input id="warnVoltage" type="number" min="3200" max="3900" step="10"></div>
-<div class="span3"><label for="cutoffVoltage">Cutoff mV</label><input id="cutoffVoltage" type="number" min="3000" max="3600" step="10"></div>
-<div class="span3"><label for="sysDown">PMU power-down mV</label><input id="sysDown" type="number" min="2600" max="3300" step="100"></div>
-<div class="span3"><label for="powerKey">Power key off seconds</label><select id="powerKey"><option>4</option><option>6</option><option>8</option><option>10</option></select></div>
-</div></details>
-<section class="panel actions-panel"><h2 title="Save settings or restart the T-Beam">Actions</h2><div class="actions"><button class="primary" id="saveBtn">Save</button><button class="danger" id="rebootBtn">Reboot</button><span class="muted" id="message"></span></div></section>
-</main>
-<script>
-const $=id=>document.getElementById(id);
-let current={};
-let timeZoneRows=[];
-const tips={
-topline:'Live summary of network mode, device IP, UTC/local time, and connected AP clients.',
-status:'Live operational metrics. Each metric tile also has its own tooltip.',
-networkModeAp:'Start directly as the off-grid access point and skip network-client connection attempts.',
-networkModeClient:'Try the configured network-client SSID first, then fall back to standalone AP mode if connection fails or is later lost.',
-staSsid:'SSID of the existing WiFi network to join when Client Mode with AP Fallback is selected. Type hidden SSIDs here, or choose a scanned network below.',
-scanBtn:'Scan nearby WiFi networks and refresh Scan results. Scanning does not overwrite the SSID field.',
-staPass:'Password for the selected network-client WiFi network. It is saved only when you press Save.',
-scanSelect:'Nearby WiFi networks discovered by the last scan. Choosing one copies that SSID into the Network Client SSID field.',
-hostname:'Hostname used on the LAN and for mDNS services. Keep it short, unique, and DNS-safe.',
-staDhcp:'Use the router DHCP lease in LAN mode. Turn this off only when you want a fixed IPv4 address.',
-connectTimeout:'How long to try joining home WiFi before falling back to standalone AP mode.',
-staticIp:'Fixed IPv4 address to use when DHCP is disabled.',
-gateway:'IPv4 gateway for static LAN mode. Usually the router address.',
-subnet:'Subnet mask for static LAN mode, normally 255.255.255.0 on small networks.',
-dns1:'DNS server used by the T-Beam in LAN mode when static addressing is selected.',
-apSsid:'Standalone AP network name. The literal token {mac} is replaced with the last six MAC hex digits for this unit before the AP starts.',
-apSsidNote:'Shows the AP SSID after {mac} expansion, using the value reported by the firmware.',
-apPass:'Standalone AP password. Default is tbeam-ntp. Secure AP modes require at least 8 characters.',
-apSecurity:'Standalone AP security mode. WEP is not offered because ESP32 SoftAP mode does not support WEP.',
-apChannel:'2.4 GHz WiFi channel for standalone AP mode. Use 1, 6, or 11 when avoiding overlap.',
-apMax:'Maximum SoftAP stations allowed. Higher values increase management and buffer pressure.',
-apIp:'IPv4 address of the T-Beam in standalone AP mode. DHCP, DNS, portal, and NTP use this address.',
-apSubnet:'Subnet mask handed to standalone AP clients by the DHCP server.',
-opt42:'Advertise the T-Beam AP IP as the NTP server with DHCP option 42.',
-dnsAliases:'Answer configured NTP hostnames with the T-Beam AP IP so clients already pointed at public time servers still work off-grid.',
-dnsWildcard:'Answer other DNS names with the T-Beam AP IP for captive portal discovery and easier onboarding.',
-ntpHosts:'One NTP hostname per line. These names are answered locally by DNS in standalone AP mode.',
-timeModeOffset:'Use a fixed UTC offset entered as hours and minutes. This mode does not apply daylight-saving changes.',
-timeModeIana:'Choose a current timezone preset loaded from the editable timezone file.',
-timeModePosix:'Use the POSIX TZ rule string exactly as entered below.',
-offsetModeFields:'Fixed local offset from UTC, entered without doing minute math by hand.',
-ianaModeFields:'Preset timezone selector for current daylight-saving behavior.',
-posixModeFields:'Manual POSIX timezone rule entry for advanced or custom local-time behavior.',
-offsetSign:'Direction of the local offset from UTC. UTC- is used west of Greenwich, such as US time zones.',
-offsetHours:'Hour portion of the fixed UTC offset. The firmware converts this to minutes internally.',
-offsetMinutes:'Minute portion of the fixed UTC offset. Use values like 30 or 45 for half-hour and quarter-hour zones.',
-ianaTimeZone:'Timezone preset name. If the timezone file is removed, this mode falls back to the POSIX rule field.',
-posixTimezone:'Manual POSIX timezone rule for local display time. Example: PST8PDT,M3.2.0/2,M11.1.0/2.',
-observeDst:'Compatibility field retained for older saved settings.',
-autoOffset:'Compatibility field retained for older saved settings.',
-manualOffset:'Internal fixed UTC offset in minutes, generated from the hour/minute controls.',
-batteryMeter:'Live battery gauge from the AXP192. Shows USB-only operation cleanly when no battery is installed.',
-batteryPct:'Battery charge estimate from the AXP192 fuel gauge.',
-batteryState:'Charging, discharging, idle, USB-only, or PMU-offline state.',
-batteryDetails:'Battery voltage/current detail and USB input telemetry when available.',
-chargeEnabled:'Allow AXP192 battery charging using the configured current and voltage limits.',
-chargeCurrent:'Li-Ion charge current limit. Conservative values reduce heat and battery stress.',
-chargeVoltage:'Li-Ion charge termination voltage. 4100 mV is conservative; 4200 mV maximizes capacity.',
-vbusLimit:'USB/VBUS input current limit. Use 500 mA for normal USB ports, 100 mA for weak sources, Off to disable the limiter.',
-warnVoltage:'Battery voltage that marks the power state as warning while discharging.',
-cutoffVoltage:'Battery voltage that requests PMU shutdown while discharging after the debounce interval.',
-sysDown:'AXP192 system power-down threshold. Keep below the battery cutoff setting.',
-powerKey:'AXP192 long-press duration for PMU power-off behavior.',
-oledCycle:'Automatically rotate OLED status screens.',
-oledCycleSeconds:'Seconds each OLED screen remains visible while auto-cycle is enabled.',
-screenTimeout:'Seconds of no display activity before the OLED turns off. Use 0 to disable the screensaver.',
-saveBtn:'Write the displayed settings to LittleFS. The firmware avoids flash writes until this is pressed.',
-rebootBtn:'Restart the T-Beam. Network mode and AP settings take effect cleanly after reboot.',
-message:'Save, scan, and reboot status messages appear here.'
-};
-const metricTips={
-Mode:'Current network mode: AP for standalone service or STA for LAN client mode.',
-Version:'Firmware version running on this T-Beam.',
-IP:'IPv4 address currently serving the portal and NTP.',
-UTC:'GPS-derived UTC time. NTP uses UTC and ignores local timezone settings.',
-Local:'Display-only local time after POSIX TZ/DST or fallback offset handling.',
-TZ:'Timezone abbreviation, daylight-saving state, or numeric fallback offset.',
-PPS:'Whether recent GPS PPS edges are disciplining the firmware clock.',
-GPS:'Fix quality summary with satellite count and grid square when available.',
-Location:'Current GPS latitude and longitude when a fix is fresh.',
-Altitude:'GPS altitude in meters when available.',
-DOP:'Dilution of precision reported by the GPS receiver.',
-Battery:'AXP192 battery presence, voltage, and charge/discharge current.',
-VBUS:'USB/VBUS voltage and current reported by the AXP192.',
-'NTP/DNS':'NTP requests, suppressed NTP requests, and DNS query count.',
-Heap:'Available ESP32 heap and PSRAM for stability monitoring.'
-};
-function escAttr(s){return String(s??'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
-function metric(k,v,c='',tip=''){return `<div class="metric" title="${escAttr(tip||metricTips[k]||k)}"><b>${k}</b><span class="${c}">${v??''}</span></div>`}
-function applyTooltips(){Object.keys(tips).forEach(id=>{const el=$(id);if(!el)return;el.title=tips[id];const label=document.querySelector(`label[for="${id}"]`);if(label)label.title=tips[id];const wrap=el.closest('.check');if(wrap)wrap.title=tips[id]})}
-function offsetLabel(m){const s=m>=0?'+':'-';const a=Math.abs(m||0);return `UTC${s}${String(Math.floor(a/60)).padStart(2,'0')}:${String(a%60).padStart(2,'0')}`}
-async function getJson(url,opts){const r=await fetch(url,opts);if(!r.ok)throw new Error(await r.text());return r.json()}
-function setMsg(t,c=''){const el=$('message');el.textContent=t;el.className='muted '+c}
-function setOffsetControls(minutes){const m=Number(minutes)||0;$('offsetSign').value=m<0?'-1':'1';const a=Math.abs(m);$('offsetHours').value=Math.floor(a/60);$('offsetMinutes').value=a%60;$('manualOffset').value=m}
-function offsetFromControls(){const sign=+$('offsetSign').value||1;const h=Math.min(14,Math.max(0,+$('offsetHours').value||0));const m=Math.min(59,Math.max(0,+$('offsetMinutes').value||0));return sign*(h*60+m)}
-function getNetworkMode(){const el=document.querySelector('input[name="networkMode"]:checked');return el?el.value:'standaloneAp'}
-function setNetworkMode(mode){const id=mode==='clientWithApFallback'?'networkModeClient':'networkModeAp';($(id)||$('networkModeAp')).checked=true}
-function getTimeMode(){const el=document.querySelector('input[name="timeMode"]:checked');return el?el.value:'iana'}
-function updateTimeModeVisibility(){const mode=getTimeMode();document.querySelectorAll('.time-mode-body').forEach(el=>el.classList.toggle('hidden',el.dataset.timeMode!==mode))}
-function wireTimeModeControls(){document.querySelectorAll('input[name="timeMode"]').forEach(el=>{el.onchange=updateTimeModeVisibility})}
-function setTimeMode(mode){const id='timeMode'+String(mode||'iana').replace(/^./,c=>c.toUpperCase());const el=$(id)||$('timeModeIana');el.checked=true;updateTimeModeVisibility()}
-function populateTimeZones(selected){const sel=$('ianaTimeZone');sel.innerHTML='';if(!timeZoneRows.length){const o=document.createElement('option');o.value=selected||'';o.textContent='Timezone file missing';sel.appendChild(o);sel.disabled=true;return}sel.disabled=false;timeZoneRows.forEach(z=>{const o=document.createElement('option');o.value=z.name;o.textContent=z.name;sel.appendChild(o)});sel.value=selected||'America/Los_Angeles';if(sel.value!==selected&&selected){const o=document.createElement('option');o.value=selected;o.textContent=selected+' (not in file)';sel.insertBefore(o,sel.firstChild);sel.value=selected}}
-async function loadTimeZones(){try{const r=await fetch('/api/timezones');if(!r.ok)throw new Error('missing');const text=await r.text();timeZoneRows=text.split(/\r?\n/).map(x=>x.trim()).filter(x=>x&&!x.startsWith('#')).map(x=>{const p=x.split('\t');return{name:p[0],posix:p.slice(1).join('\t')}}).filter(x=>x.name&&x.posix)}catch(e){timeZoneRows=[]}}
-function setScanPrompt(text,disabled=true){const sel=$('scanSelect');if(!sel)return;sel.innerHTML='';const o=document.createElement('option');o.value='';o.textContent=text;o.selected=true;sel.appendChild(o);sel.disabled=disabled}
-function scanOptionLabel(n){return `${n.ssid} (${n.rssi} dBm, ch ${n.channel}, ${n.auth||'unknown'})`}
-function updateApSecurityUi(){const open=$('apSecurity').value==='open';$('apPass').disabled=open;$('apPass').placeholder=open?'not used in open mode':''}
-function batteryPercentValue(p){const raw=Number(p&&p.batteryPercent);return Number.isFinite(raw)&&raw>=0?Math.min(100,Math.max(0,Math.round(raw))):null}
-function batteryFillClass(p,percent){return 'battery-fill '+((p&&p.warning)||percent<=10?'bad':percent<=25?'warn':'')}
-function updateBatteryMeter(p){const fill=$('batteryFill'),pct=$('batteryPct'),state=$('batteryState'),details=$('batteryDetails');if(!fill||!pct||!state||!details)return;if(!p||!p.online){fill.style.width='0%';fill.className='battery-fill bad';pct.textContent='--';state.textContent='PMU offline';details.textContent='No AXP192 telemetry';return}if(!p.batteryPresent){fill.style.width='0%';fill.className='battery-fill';pct.textContent='USB';state.textContent=p.vbusPresent?'\u26A1 USB power':'No battery';details.textContent=p.vbusPresent?`${Number(p.vbusMv||0).toFixed(0)} mV ${Number(p.vbusCurrentMa||0).toFixed(0)} mA VBUS`:'Battery not detected';return}const raw=Number(p.batteryPercent);const percent=Number.isFinite(raw)&&raw>=0?Math.min(100,Math.max(0,Math.round(raw))):0;fill.style.width=percent+'%';fill.className='battery-fill '+(p.warning||percent<=10?'bad':percent<=25?'warn':'');pct.textContent=Number.isFinite(raw)&&raw>=0?percent+'%':'--';state.textContent=p.charging?'\u26A1 Charging':(p.discharging?'\u25BE Discharging':'Idle');details.textContent=`${Number(p.batteryMv||0).toFixed(0)} mV ${Number(p.batteryCurrentMa||0).toFixed(0)} mA`}
-function statusBatteryMetric(p){const title='Compact battery charge indicator. Lightning means charging.';if(!p||!p.online)return `<div class="metric" title="${title}"><b>Battery</b><span class="bad">PMU offline</span></div>`;if(!p.batteryPresent)return `<div class="metric" title="${title}"><b>Battery</b><div class="status-battery-row"><div class="battery-shell"><div class="battery-fill" style="width:0%"></div></div><span class="status-battery-percent">USB</span></div></div>`;const percent=batteryPercentValue(p);const shown=percent===null?0:percent;const label=percent===null?'--':percent+'%';const state=p.charging?'<span class="charge-bolt" title="Charging">\u26A1</span><span class="status-battery-state">Charging</span>':(p.discharging?'<span class="status-battery-state">Discharging</span>':'<span class="status-battery-state">Idle</span>');return `<div class="metric" title="${title}"><b>Battery</b><div class="status-battery-row"><div class="battery-shell"><div class="${batteryFillClass(p,shown)}" style="width:${shown}%"></div></div><span class="status-battery-percent">${label}</span>${state}</div></div>`}
-function fillSettings(s){
-current=s;const d=s.display||{},t=s.time||{};
-$('hostname').value=s.hostname||'';setNetworkMode(s.networkMode||((s.wifi.ssid||'')?'clientWithApFallback':'standaloneAp'));$('staSsid').value=s.wifi.ssid||'';$('staPass').value=s.wifi.password||'';$('staDhcp').checked=!!s.wifi.dhcp;$('staticIp').value=s.wifi.staticIp;$('gateway').value=s.wifi.gateway;$('subnet').value=s.wifi.subnet;$('dns1').value=s.wifi.dns1;$('connectTimeout').value=s.wifi.connectTimeoutSec;$('apSsid').value=s.ap.ssid;$('apPass').value=s.ap.password;$('apSecurity').value=s.ap.security||'wpa2';updateApSecurityUi();$('apIp').value=s.ap.ip;$('apSubnet').value=s.ap.subnet;$('apChannel').value=s.ap.channel;$('apMax').value=s.ap.maxClients;$('opt42').checked=!!s.standalone.dhcpOption42;$('dnsAliases').checked=!!s.standalone.dnsNtpAliases;$('dnsWildcard').checked=!!s.standalone.dnsWildcardCaptive;$('ntpHosts').value=(s.standalone.ntpHosts||[]).join('\n');setTimeMode(t.mode||((t.observeDst===false)?'offset':'posix'));setOffsetControls(t.manualOffsetMinutes??0);populateTimeZones(t.ianaTimeZone||'America/Los_Angeles');$('posixTimezone').value=t.posixTimezone||'PST8PDT,M3.2.0/2,M11.1.0/2';$('observeDst').value='';$('autoOffset').value='';$('chargeEnabled').checked=!!s.power.chargeEnabled;$('chargeCurrent').value=s.power.chargeCurrentMa;$('chargeVoltage').value=s.power.chargeTargetMv;$('vbusLimit').value=s.power.vbusCurrentLimitMa;$('warnVoltage').value=s.power.warningVoltageMv;$('cutoffVoltage').value=s.power.cutoffVoltageMv;$('sysDown').value=s.power.sysPowerDownMv;$('powerKey').value=s.power.powerKeyOffSeconds;$('oledCycle').checked=d.autoCycle!==false;$('oledCycleSeconds').value=d.cycleSeconds||5;$('screenTimeout').value=d.screensaverTimeoutSec??300;const ex=s.ap.expandedSsid||s.ap.ssid||'';$('apSsidNote').textContent=`Use {mac} to insert this unit's last six MAC hex digits. Current AP SSID: ${ex}.`}
-function readSettings(){const mode=getTimeMode(),offset=offsetFromControls();return{networkMode:getNetworkMode(),hostname:$('hostname').value,wifi:{ssid:$('staSsid').value,password:$('staPass').value,dhcp:$('staDhcp').checked,staticIp:$('staticIp').value,gateway:$('gateway').value,subnet:$('subnet').value,dns1:$('dns1').value,dns2:(current.wifi&&current.wifi.dns2)||'1.1.1.1',connectTimeoutSec:+$('connectTimeout').value},ap:{ssid:$('apSsid').value,password:$('apPass').value,security:$('apSecurity').value,ip:$('apIp').value,subnet:$('apSubnet').value,channel:+$('apChannel').value,maxClients:+$('apMax').value},standalone:{dhcpOption42:$('opt42').checked,dnsNtpAliases:$('dnsAliases').checked,dnsWildcardCaptive:$('dnsWildcard').checked,ntpHosts:$('ntpHosts').value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean)},time:{mode,ianaTimeZone:$('ianaTimeZone').value,posixTimezone:$('posixTimezone').value.trim(),autoLocalOffset:false,observeDst:mode!=='offset',manualOffsetMinutes:offset},display:{autoCycle:$('oledCycle').checked,cycleSeconds:+$('oledCycleSeconds').value,screensaverTimeoutSec:+$('screenTimeout').value},power:{chargeEnabled:$('chargeEnabled').checked,chargeCurrentMa:+$('chargeCurrent').value,chargeTargetMv:+$('chargeVoltage').value,vbusCurrentLimitMa:+$('vbusLimit').value,warningVoltageMv:+$('warnVoltage').value,cutoffVoltageMv:+$('cutoffVoltage').value,sysPowerDownMv:+$('sysDown').value,powerKeyOffSeconds:+$('powerKey').value}}}
-async function refreshStatus(){try{const s=await getJson('/api/status');updateBatteryMeter(s.power);$('topline').textContent=`${s.mode} ${s.ip} | UTC ${s.utc||'not synced'} | Local ${s.local||'not synced'} | clients ${s.clients}`;let gps=s.gps.fix?'ok':(s.gps.seen?'warn':'bad');let pwr=s.power.online?(s.power.warning?'warn':'ok'):'warn';let tz=s.timeZone?`${s.timeZone} ${s.dstActive?'DST':'STD'}`:offsetLabel(s.localOffsetMinutes);$('status').innerHTML=metric('Mode',s.mode)+metric('Version',s.version||'')+metric('IP',s.ip)+metric('UTC',s.utc||'not synced',s.clock.synced?'ok':'bad')+metric('Local',s.local||'not synced',s.clock.synced?'ok':'bad')+metric('TZ',tz)+metric('PPS',s.clock.pps?'locked':'waiting',s.clock.pps?'ok':'warn')+metric('GPS',`${s.gps.sats} sats ${s.gps.grid||''}`,gps)+metric('Location',s.gps.fix?`${s.gps.lat.toFixed(6)}, ${s.gps.lon.toFixed(6)}`:'no fix')+metric('Altitude',s.gps.fix?`${s.gps.alt.toFixed(1)} m`:'')+metric('DOP',s.gps.dop||'')+metric('Battery',s.power.online?(s.power.batteryPresent?`${s.power.batteryMv} mV ${s.power.batteryCurrentMa.toFixed(0)} mA`:'no battery'):'PMU offline',pwr)+metric('VBUS',s.power.online?`${s.power.vbusMv} mV ${s.power.vbusCurrentMa.toFixed(0)} mA`:'')+metric('NTP/DNS',`${s.ntpRequests}/${s.ntpSuppressed} / ${s.dnsQueries}`)+metric('Heap',`${s.heap.free} free, PSRAM ${s.heap.psramFree}`)+statusBatteryMetric(s.power)}catch(e){setMsg(e.message,'bad')}}
-async function load(){applyTooltips();wireTimeModeControls();$('apSecurity').onchange=updateApSecurityUi;await loadTimeZones();fillSettings(await getJson('/api/settings'));refreshStatus();setInterval(refreshStatus,2000)}
-$('saveBtn').onclick=async()=>{try{setMsg('Saving');await getJson('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(readSettings())});setMsg('Saved. Reboot to apply network changes.','ok')}catch(e){setMsg(e.message,'bad')}};
-$('rebootBtn').onclick=async()=>{if(confirm('Reboot now?')){await fetch('/api/reboot',{method:'POST'});setMsg('Rebooting')}};
-$('scanSelect').onchange=()=>{const sel=$('scanSelect');if(sel.value){$('staSsid').value=sel.value;setMsg(`Selected ${sel.value}. Press Save to store it.`,'ok')}};
-$('scanBtn').onclick=async()=>{const btn=$('scanBtn');try{btn.disabled=true;btn.textContent='Scanning';setScanPrompt('Scanning...',true);setMsg('Scanning');const s=await getJson('/api/scan');if(s.error)throw new Error(s.error);const networks=(s.networks||[]).slice().sort((a,b)=>(Number(b.rssi)||-999)-(Number(a.rssi)||-999));const named=networks.filter(n=>n.ssid);const sel=$('scanSelect');sel.innerHTML='';const prompt=document.createElement('option');prompt.value='';prompt.textContent=named.length?`Select a network - ${named.length} found`:'No named networks found';prompt.selected=true;sel.appendChild(prompt);named.forEach(n=>{const o=document.createElement('option');o.value=n.ssid;o.textContent=scanOptionLabel(n);sel.appendChild(o)});sel.disabled=!named.length;$('staSsid').placeholder=named.length?'Type SSID or choose a scan result':'Type hidden SSID manually';if(named.length){setMsg(`Found ${named.length} named networks${s.count>networks.length?' (showing strongest 40)':''}. Choose one or type a hidden SSID.`,'ok')}else{setMsg('No named networks found. Type a hidden SSID manually if needed.','warn')}}catch(e){setScanPrompt('Scan failed',true);setMsg(e.message,'bad')}finally{btn.disabled=false;btn.textContent='Scan'}};
-load();
-</script>
-</body>
-</html>
-)HTML";
+static void closeHttpConnection() {
+  WiFiClient client = server.client();
+  client.flush();
+  client.stop();
+}
+
+static void sendStaticResponse(int code, const char *contentType, const char *body) {
+  server.send(code, contentType, body);
+  closeHttpConnection();
+}
 
 static void sendJson(JsonDocument &doc) {
   String output;
+  output.reserve(measureJson(doc));
   serializeJson(doc, output);
+  server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", output);
+  closeHttpConnection();
+}
+
+static bool streamLittleFsFile(File &file, const char *contentType) {
+  if (!file) {
+    return false;
+  }
+
+  uint8_t *buffer = static_cast<uint8_t *>(
+      heap_caps_malloc_prefer(FILE_STREAM_BUFFER_SIZE, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_8BIT));
+  if (!buffer) {
+    buffer = static_cast<uint8_t *>(heap_caps_malloc(FILE_STREAM_BUFFER_SIZE, MALLOC_CAP_8BIT));
+  }
+  if (!buffer) {
+    sendStaticResponse(500, "text/plain", "stream buffer allocation failed");
+    return false;
+  }
+
+  server.setContentLength(file.size());
+  server.send(200, contentType, "");
+
+  bool ok = true;
+  while (file.available()) {
+    int bytesRead = file.read(buffer, FILE_STREAM_BUFFER_SIZE);
+    if (bytesRead <= 0) {
+      ok = false;
+      break;
+    }
+    server.sendContent(reinterpret_cast<const char *>(buffer), static_cast<size_t>(bytesRead));
+    yield();
+  }
+
+  heap_caps_free(buffer);
+  closeHttpConnection();
+  return ok;
+}
+
+static bool clientAcceptsGzip() {
+  String acceptEncoding = server.header("Accept-Encoding");
+  acceptEncoding.toLowerCase();
+  return acceptEncoding.indexOf("gzip") >= 0;
 }
 
 static void handleRoot() {
-  server.send_P(200, "text/html", INDEX_HTML);
+  bool useGzip = clientAcceptsGzip() && portalGzipPresent;
+  File file = LittleFS.open(useGzip ? PORTAL_GZIP_PATH : PORTAL_HTML_PATH, "r");
+  if (!file) {
+    sendStaticResponse(500, "text/html",
+                       "<!doctype html><html><body><h1>T-Beam NTP Server</h1>"
+                       "<p>Portal file missing from LittleFS. Upload the filesystem image.</p></body></html>");
+    return;
+  }
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Vary", "Accept-Encoding");
+  if (useGzip) {
+    server.sendHeader("Content-Encoding", "gzip");
+  }
+  streamLittleFsFile(file, "text/html");
+  file.close();
 }
 
 static void handleSettingsGet() {
@@ -1953,32 +2368,32 @@ static void handleSettingsGet() {
 static void handleTimezones() {
   File file = LittleFS.open(TIMEZONE_DB_PATH, "r");
   if (!file) {
-    server.send(404, "text/plain", "timezone preset file not found");
+    sendStaticResponse(404, "text/plain", "timezone preset file not found");
     return;
   }
   server.sendHeader("Cache-Control", "no-store");
-  server.streamFile(file, "text/tab-separated-values");
+  streamLittleFsFile(file, "text/tab-separated-values");
   file.close();
 }
 
 static void handleSettingsSave() {
   if (!server.hasArg("plain")) {
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing body\"}");
+    sendStaticResponse(400, "application/json", "{\"ok\":false,\"error\":\"missing body\"}");
     return;
   }
   PsramJsonDocument doc(12288);
   DeserializationError error = deserializeJson(doc, server.arg("plain"));
   if (error) {
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid json\"}");
+    sendStaticResponse(400, "application/json", "{\"ok\":false,\"error\":\"invalid json\"}");
     return;
   }
   applySettingsJson(doc);
   applyPowerSettings();
   if (!saveSettings()) {
-    server.send(500, "application/json", "{\"ok\":false,\"error\":\"save failed\"}");
+    sendStaticResponse(500, "application/json", "{\"ok\":false,\"error\":\"save failed\"}");
     return;
   }
-  server.send(200, "application/json", "{\"ok\":true,\"rebootRecommended\":true}");
+  sendStaticResponse(200, "application/json", "{\"ok\":true,\"rebootRecommended\":true}");
 }
 
 static void handleScan() {
@@ -2005,61 +2420,88 @@ static void handleScan() {
 }
 
 static void handleReboot() {
-  server.send(200, "application/json", "{\"ok\":true}");
+  sendStaticResponse(200, "application/json", "{\"ok\":true}");
   delay(250);
   ESP.restart();
 }
 
-static void handleStatus() {
+struct StatusSnapshot {
+  uint64_t nowUsec;
+  bool synced;
+  bool servingTime;
+  int16_t localOffsetMinutes;
+  bool gpsFix;
+};
+
+static StatusSnapshot captureStatusSnapshot() {
   uint64_t nowUsec = 0;
   bool synced = getClockUnixUsec(nowUsec);
   bool servingTime = synced && hasFreshGpsTime();
-  int16_t localOffset = servingTime ? currentLocalOffsetMinutes(nowUsec) : currentLocalOffsetMinutes();
-  bool gpsFix = hasFreshGpsFix();
+  return {
+      nowUsec,
+      synced,
+      servingTime,
+      servingTime ? currentLocalOffsetMinutes(nowUsec) : currentLocalOffsetMinutes(),
+      hasFreshGpsFix()};
+}
 
-  PsramJsonDocument doc(12288);
+static void writeStatusRootJson(JsonDocument &doc, const StatusSnapshot &snapshot) {
   doc["mode"] = networkMode == NetworkMode::Sta ? "STA" : "AP";
   doc["networkMode"] = networkStartModeName(settings.networkStartMode);
   doc["version"] = FIRMWARE_VERSION;
+  doc["hardwareRevision"] = hardwareRevisionLabel();
+  doc["pmic"] = pmicModelLabel();
+  doc["pmicRegister03Valid"] = pmicRegister03Valid;
+  doc["pmicRegister03"] = pmicRegister03Valid ? pmicRegister03 : -1;
   doc["ip"] = networkMode == NetworkMode::Sta ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
   doc["hostname"] = sanitizedHostname();
   doc["clients"] = networkMode == NetworkMode::ApFallback ? WiFi.softAPgetStationNum() : 0;
   doc["apSecurity"] = apSecurityModeName(settings.apSecurityMode);
-  doc["utc"] = servingTime ? formatUtc(nowUsec) : "";
-  doc["local"] = servingTime ? formatLocal(nowUsec) : "";
-  doc["localOffsetMinutes"] = localOffset;
-  doc["timeZone"] = servingTime ? localTimezoneName(nowUsec) : "";
+  doc["utc"] = snapshot.servingTime ? formatUtc(snapshot.nowUsec) : "";
+  doc["local"] = snapshot.servingTime ? formatLocal(snapshot.nowUsec) : "";
+  doc["localOffsetMinutes"] = snapshot.localOffsetMinutes;
+  doc["timeZone"] = snapshot.servingTime ? localTimezoneName(snapshot.nowUsec) : "";
   doc["localTimeMode"] = localTimeModeName(settings.localTimeMode);
   doc["ianaTimeZone"] = settings.ianaTimeZone;
-  doc["timeZoneDatabasePresent"] = littleFsFileExists(TIMEZONE_DB_PATH);
-  doc["dstActive"] = servingTime && isLocalDstActive(nowUsec);
+  doc["timeZoneDatabasePresent"] = timezoneDbPresent;
+  doc["dstActive"] = snapshot.servingTime && isLocalDstActive(snapshot.nowUsec);
   doc["ntpRequests"] = ntpRequestCount;
+  doc["ntpResponses"] = ntpResponseCount;
   doc["ntpSuppressed"] = ntpSuppressedCount;
   doc["dnsQueries"] = dnsQueryCount;
   doc["dnsAliasHits"] = dnsAliasHitCount;
+}
 
+static void writeClockStatusJson(JsonDocument &doc, const StatusSnapshot &snapshot) {
   JsonObject clock = doc.createNestedObject("clock");
-  clock["synced"] = servingTime;
-  clock["hasClock"] = synced;
+  clock["synced"] = snapshot.servingTime;
+  clock["hasClock"] = snapshot.synced;
   clock["pps"] = hasRecentPps();
   clock["lastSyncMs"] = lastClockSyncMs;
   clock["lastGpsTimeAgeMs"] = lastNmeaUpdateMs ? static_cast<int32_t>(millis() - lastNmeaUpdateMs) : -1;
   clock["lastPpsAgeMs"] = lastPpsMs ? static_cast<int32_t>(millis() - lastPpsMs) : -1;
+}
 
+static void writeGpsStatusJson(JsonDocument &doc, const StatusSnapshot &snapshot) {
   JsonObject gpsJson = doc.createNestedObject("gps");
   gpsJson["seen"] = gps.charsProcessed() > 0;
-  gpsJson["fix"] = gpsFix;
+  gpsJson["fix"] = snapshot.gpsFix;
   gpsJson["sats"] = gps.satellites.isValid() ? gps.satellites.value() : 0;
-  gpsJson["lat"] = gpsFix ? gps.location.lat() : 0.0;
-  gpsJson["lon"] = gpsFix ? gps.location.lng() : 0.0;
+  gpsJson["lat"] = snapshot.gpsFix ? gps.location.lat() : 0.0;
+  gpsJson["lon"] = snapshot.gpsFix ? gps.location.lng() : 0.0;
   gpsJson["alt"] = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
   gpsJson["dop"] = gpsDopString();
-  gpsJson["grid"] = gpsFix ? maidenhead(gps.location.lat(), gps.location.lng()) : "";
+  gpsJson["grid"] = snapshot.gpsFix ? maidenhead(gps.location.lat(), gps.location.lng()) : "";
   gpsJson["chars"] = gps.charsProcessed();
   gpsJson["sentences"] = gps.sentencesWithFix();
+}
 
+static void writePowerStatusJson(JsonDocument &doc) {
   JsonObject power = doc.createNestedObject("power");
   power["online"] = powerState.online;
+  power["pmic"] = pmicModelLabel();
+  power["pmicRegister03Valid"] = pmicRegister03Valid;
+  power["pmicRegister03"] = pmicRegister03Valid ? pmicRegister03 : -1;
   power["batteryPresent"] = powerState.batteryPresent;
   power["charging"] = powerState.charging;
   power["discharging"] = powerState.discharging;
@@ -2073,30 +2515,57 @@ static void handleStatus() {
   power["temperatureC"] = powerState.temperatureC;
   power["warning"] = powerState.warning;
   power["cutoffPending"] = powerState.cutoffPending;
+}
 
+static void writeHeapStatusJson(JsonDocument &doc) {
   JsonObject heap = doc.createNestedObject("heap");
   heap["free"] = ESP.getFreeHeap();
   heap["minFree"] = ESP.getMinFreeHeap();
   heap["psramSize"] = ESP.getPsramSize();
   heap["psramFree"] = ESP.getFreePsram();
+}
 
-  doc["i2c"] = i2cDevices;
+static void writeDisplayStatusJson(JsonDocument &doc) {
   JsonObject displaySettings = doc.createNestedObject("display");
   displaySettings["page"] = oledPage;
   displaySettings["sleeping"] = oledSleeping;
+}
+
+static void handleStatus() {
+  StatusSnapshot snapshot = captureStatusSnapshot();
+  PsramJsonDocument doc(12288);
+  writeStatusRootJson(doc, snapshot);
+  writeClockStatusJson(doc, snapshot);
+  writeGpsStatusJson(doc, snapshot);
+  writePowerStatusJson(doc);
+  writeHeapStatusJson(doc);
+  doc["i2c"] = i2cDevices;
+  writeDisplayStatusJson(doc);
   sendJson(doc);
+}
+
+static String portalBaseUrl() {
+  IPAddress address = networkMode == NetworkMode::Sta ? WiFi.localIP() : WiFi.softAPIP();
+  return String("http://") + address.toString() + "/";
 }
 
 static void handleNotFound() {
   if (networkMode == NetworkMode::ApFallback) {
-    server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
-    server.send(302, "text/plain", "");
+    server.sendHeader("Location", portalBaseUrl(), true);
+    sendStaticResponse(302, "text/plain", "Redirecting");
   } else {
-    server.send(404, "text/plain", "Not found");
+    sendStaticResponse(404, "text/plain", "Not found");
   }
 }
 
+static void handleCaptiveProbe() {
+  server.sendHeader("Location", portalBaseUrl(), true);
+  sendStaticResponse(302, "text/plain", "Redirecting");
+}
+
 static void beginWeb() {
+  static const char *headerKeys[] = {"Accept-Encoding"};
+  server.collectHeaders(headerKeys, 1);
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/settings", HTTP_GET, handleSettingsGet);
   server.on("/api/timezones", HTTP_GET, handleTimezones);
@@ -2104,10 +2573,10 @@ static void beginWeb() {
   server.on("/api/scan", HTTP_GET, handleScan);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/reboot", HTTP_POST, handleReboot);
-  server.on("/generate_204", HTTP_GET, handleRoot);
-  server.on("/hotspot-detect.html", HTTP_GET, handleRoot);
-  server.on("/connecttest.txt", HTTP_GET, handleRoot);
-  server.on("/ncsi.txt", HTTP_GET, handleRoot);
+  server.on("/generate_204", HTTP_GET, handleCaptiveProbe);
+  server.on("/hotspot-detect.html", HTTP_GET, handleCaptiveProbe);
+  server.on("/connecttest.txt", HTTP_GET, handleCaptiveProbe);
+  server.on("/ncsi.txt", HTTP_GET, handleCaptiveProbe);
   server.onNotFound(handleNotFound);
   server.begin();
 }
@@ -2283,6 +2752,130 @@ static void drawLowBatteryOverlay() {
   display.setColor(WHITE);
 }
 
+static void drawOledSummaryPage(uint64_t nowUsec, bool servingTime, bool gpsFix) {
+  drawLine(0, networkMode == NetworkMode::Sta ? "WiFi STA " + WiFi.localIP().toString() : "AP " + WiFi.softAPIP().toString());
+  drawLine(12, servingTime ? "UTC " + formatUtc(nowUsec).substring(11) : "NTP gated: no GPS");
+  drawLine(24, servingTime ? "LOC " + formatLocal(nowUsec).substring(11) : "LOC not synced");
+  drawLine(36, String("GPS ") + (gpsFix ? "fix" : "no fix") + " PPS " + (hasRecentPps() ? "lock" : "wait"));
+  drawLine(48, String("NTP ") + ntpRequestCount + "/" + ntpSuppressedCount + " DNS " + dnsQueryCount);
+}
+
+static void drawOledGridPage(bool gpsFix) {
+  String grid = gpsFix ? maidenhead(gps.location.lat(), gps.location.lng()) : "";
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.setFont(ArialMT_Plain_10);
+  drawLine(0, "Grid Square");
+  drawCentered(17, grid.length() ? grid : "--", ArialMT_Plain_24);
+  display.setFont(ArialMT_Plain_10);
+  drawCentered(48, gpsFix ? "GPS fix" : "waiting for fix", ArialMT_Plain_10);
+}
+
+static void drawOledGpsPage(bool gpsFix) {
+  drawText(0, String("Sat ") + (gps.satellites.isValid() ? gps.satellites.value() : 0) + " DOP " + gpsDopString(), ArialMT_Plain_16);
+  drawText(16, gpsFix ? "Lat " + String(gps.location.lat(), 4) : "Lat --", ArialMT_Plain_16);
+  drawText(32, gpsFix ? "Lon " + String(gps.location.lng(), 4) : "Lon --", ArialMT_Plain_16);
+  drawText(48, gpsFix && gps.altitude.isValid() ? "Alt " + String(gps.altitude.meters(), 0) + "m" : "Alt --", ArialMT_Plain_16);
+}
+
+static void drawOledNetworkPage() {
+  drawLine(0, networkMode == NetworkMode::Sta ? "Network client" : "Standalone AP");
+  drawScrollingText(12, networkMode == NetworkMode::Sta ? WiFi.SSID() : expandedApSsid(), ArialMT_Plain_10);
+  drawLine(24, networkMode == NetworkMode::Sta ? WiFi.localIP().toString() : WiFi.softAPIP().toString());
+  drawLine(36, String("Clients ") + (networkMode == NetworkMode::ApFallback ? WiFi.softAPgetStationNum() : 0) + "/" + settings.apMaxClients);
+  drawScrollingText(48, "Pass " + apPasswordForDisplay(), ArialMT_Plain_10);
+}
+
+static void drawOledPowerPage() {
+  drawText(0, powerState.batteryPresent ? String("Bat ") + powerState.batteryMv + "mV" : "No battery", ArialMT_Plain_16);
+  drawText(16, String("I ") + String(powerState.batteryCurrentMa, 0) + "mA", ArialMT_Plain_16);
+  drawText(32, powerState.vbusPresent ? String("USB ") + powerState.vbusMv + "mV" : "USB absent", ArialMT_Plain_16);
+  drawText(48, powerState.warning ? String("Bat warning") : String("Temp ") + String(powerState.temperatureC, 0) + "C", ArialMT_Plain_16);
+}
+
+static void drawOledPage(uint64_t nowUsec, bool servingTime, bool gpsFix) {
+  display.clear();
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.setFont(ArialMT_Plain_10);
+
+  switch (oledPage) {
+  case 0:
+    drawOledSummaryPage(nowUsec, servingTime, gpsFix);
+    break;
+  case 1:
+    drawTimePage("UTC", servingTime ? formatUtc(nowUsec) : "", servingTime);
+    break;
+  case 2:
+    drawTimePage("Local Time", servingTime ? formatLocal(nowUsec) : "", servingTime);
+    break;
+  case 3:
+    drawOledGridPage(gpsFix);
+    break;
+  case 4:
+    drawOledGpsPage(gpsFix);
+    break;
+  case 5:
+    drawOledNetworkPage();
+    break;
+  default:
+    drawOledPowerPage();
+    break;
+  }
+
+  drawLowBatteryOverlay();
+  display.display();
+}
+
+static bool skipOledForSplash() {
+  if (splashUntilMs == 0) {
+    return false;
+  }
+  if (millis() < splashUntilMs) {
+    return true;
+  }
+  splashUntilMs = 0;
+  return false;
+}
+
+static void trackGpsFixForDisplay(bool gpsFix) {
+  if (gpsFix == lastDisplayGpsFix) {
+    return;
+  }
+  lastDisplayGpsFix = gpsFix;
+  wakeOled();
+}
+
+static bool applyOledScreensaver() {
+  if (lastOledActivityMs == 0) {
+    lastOledActivityMs = millis();
+  }
+  if (!oledSleeping && settings.oledScreensaverTimeoutSec > 0 &&
+      millis() - lastOledActivityMs >= static_cast<uint32_t>(settings.oledScreensaverTimeoutSec) * 1000UL) {
+    sleepOled();
+    return true;
+  }
+  return oledSleeping;
+}
+
+static void updateOledAutoCycle() {
+  if (!settings.oledAutoCycle || settings.oledCycleSeconds == 0 ||
+      beforeDeadline(oledAutoCyclePausedUntilMs) ||
+      millis() - lastOledCycleMs < static_cast<uint32_t>(settings.oledCycleSeconds) * 1000UL) {
+    return;
+  }
+  oledPage = (oledPage + 1) % OLED_PAGE_COUNT;
+  lastOledCycleMs = millis();
+  lastOledUpdateMs = 0;
+}
+
+static bool oledRefreshDue() {
+  uint32_t refreshMs = (powerState.warning || networkPageHasScrollingText()) ? 250UL : 1000UL;
+  if (millis() - lastOledUpdateMs < refreshMs) {
+    return false;
+  }
+  lastOledUpdateMs = millis();
+  return true;
+}
+
 static void factoryResetSettings(const char *reason) {
   Serial.printf("Factory reset requested: %s\n", reason ? reason : "user button");
   showFactoryResetPrompt();
@@ -2293,61 +2886,78 @@ static void factoryResetSettings(const char *reason) {
   ESP.restart();
 }
 
-static void checkBootFactoryReset() {
-  if (digitalRead(PIN_USER_BUTTON) != LOW) {
-    return;
-  }
-  Serial.println("User button held at boot; release before 10 seconds to force AP mode");
-  showBootButtonPrompt();
+static bool userButtonPressed() {
+  return digitalRead(PIN_USER_BUTTON) == LOW;
+}
+
+static void forceApForCurrentBoot() {
+  bootForceApMode = true;
+  showBootForceApPrompt();
+  delay(900);
+}
+
+static bool waitForContinuousButtonHold(uint32_t holdMs) {
   uint32_t start = millis();
-  while (millis() - start < USER_BUTTON_FACTORY_RESET_MS) {
-    if (digitalRead(PIN_USER_BUTTON) != LOW) {
-      Serial.println("Boot button released before reset threshold; forcing AP mode for this boot");
-      bootForceApMode = true;
-      showBootForceApPrompt();
-      delay(900);
-      return;
+  while (millis() - start < holdMs) {
+    if (!userButtonPressed()) {
+      return false;
     }
     delay(50);
+  }
+  return true;
+}
+
+static bool waitForButtonRelease(uint32_t timeoutMs) {
+  uint32_t deadline = millis() + timeoutMs;
+  while (userButtonPressed() && beforeDeadline(deadline)) {
+    delay(50);
+  }
+  return !userButtonPressed();
+}
+
+static void waitForResetConfirmationHold() {
+  uint32_t confirmUntilMs = millis() + FACTORY_RESET_CONFIRM_WINDOW_MS;
+  while (beforeDeadline(confirmUntilMs)) {
+    if (!userButtonPressed()) {
+      delay(50);
+      continue;
+    }
+
+    if (waitForContinuousButtonHold(USER_BUTTON_FACTORY_RESET_MS)) {
+      factoryResetSettings("boot confirmed button hold");
+    }
+
+    Serial.println("Reset confirmation press released early; forcing AP mode for this boot");
+    forceApForCurrentBoot();
+    return;
+  }
+
+  Serial.println("Reset confirmation timed out; forcing AP mode for this boot");
+  forceApForCurrentBoot();
+}
+
+static void checkBootFactoryReset() {
+  if (!userButtonPressed()) {
+    return;
+  }
+
+  Serial.println("User button held at boot; release before 10 seconds to force AP mode");
+  showBootButtonPrompt();
+  if (!waitForContinuousButtonHold(USER_BUTTON_FACTORY_RESET_MS)) {
+    Serial.println("Boot button released before reset threshold; forcing AP mode for this boot");
+    forceApForCurrentBoot();
+    return;
   }
 
   Serial.println("Factory reset threshold reached; waiting for confirmation hold");
   showResetConfirmPrompt();
-  uint32_t releaseDeadline = millis() + FACTORY_RESET_CONFIRM_WINDOW_MS;
-  while (digitalRead(PIN_USER_BUTTON) == LOW && beforeDeadline(releaseDeadline)) {
-    delay(50);
-  }
-  if (digitalRead(PIN_USER_BUTTON) == LOW) {
+  if (!waitForButtonRelease(FACTORY_RESET_CONFIRM_WINDOW_MS)) {
     Serial.println("Reset confirmation canceled; button was not released");
-    bootForceApMode = true;
-    showBootForceApPrompt();
-    delay(900);
+    forceApForCurrentBoot();
     return;
   }
 
-  uint32_t confirmUntilMs = millis() + FACTORY_RESET_CONFIRM_WINDOW_MS;
-  while (beforeDeadline(confirmUntilMs)) {
-    if (digitalRead(PIN_USER_BUTTON) == LOW) {
-      uint32_t confirmStart = millis();
-      while (digitalRead(PIN_USER_BUTTON) == LOW) {
-        if (millis() - confirmStart >= USER_BUTTON_FACTORY_RESET_MS) {
-          factoryResetSettings("boot confirmed button hold");
-        }
-        delay(50);
-      }
-      Serial.println("Reset confirmation press released early; forcing AP mode for this boot");
-      bootForceApMode = true;
-      showBootForceApPrompt();
-      delay(900);
-      return;
-    }
-    delay(50);
-  }
-
-  Serial.println("Reset confirmation timed out; forcing AP mode for this boot");
-  bootForceApMode = true;
-  showBootForceApPrompt();
-  delay(900);
+  waitForResetConfirmationHold();
 }
 
 static void updateOled() {
@@ -2355,91 +2965,26 @@ static void updateOled() {
     return;
   }
 
-  if (splashUntilMs != 0 && millis() < splashUntilMs) {
+  if (skipOledForSplash()) {
     return;
   }
-  splashUntilMs = 0;
 
   uint64_t nowUsec = 0;
   bool synced = getClockUnixUsec(nowUsec);
   bool servingTime = synced && hasFreshGpsTime();
   bool gpsFix = hasFreshGpsFix();
 
-  if (gpsFix != lastDisplayGpsFix) {
-    lastDisplayGpsFix = gpsFix;
-    wakeOled();
-  }
-
-  if (lastOledActivityMs == 0) {
-    lastOledActivityMs = millis();
-  }
-
-  if (!oledSleeping && settings.oledScreensaverTimeoutSec > 0 &&
-      millis() - lastOledActivityMs >= static_cast<uint32_t>(settings.oledScreensaverTimeoutSec) * 1000UL) {
-    sleepOled();
+  trackGpsFixForDisplay(gpsFix);
+  if (applyOledScreensaver()) {
     return;
   }
 
-  if (oledSleeping) {
+  updateOledAutoCycle();
+  if (!oledRefreshDue()) {
     return;
   }
 
-  if (settings.oledAutoCycle && settings.oledCycleSeconds > 0 &&
-      !beforeDeadline(oledAutoCyclePausedUntilMs) &&
-      millis() - lastOledCycleMs >= static_cast<uint32_t>(settings.oledCycleSeconds) * 1000UL) {
-    oledPage = (oledPage + 1) % OLED_PAGE_COUNT;
-    lastOledCycleMs = millis();
-    lastOledUpdateMs = 0;
-  }
-
-  uint32_t refreshMs = (powerState.warning || networkPageHasScrollingText()) ? 250UL : 1000UL;
-  if (millis() - lastOledUpdateMs < refreshMs) {
-    return;
-  }
-  lastOledUpdateMs = millis();
-
-  display.clear();
-  display.setTextAlignment(TEXT_ALIGN_LEFT);
-  display.setFont(ArialMT_Plain_10);
-
-  if (oledPage == 0) {
-    drawLine(0, networkMode == NetworkMode::Sta ? "WiFi STA " + WiFi.localIP().toString() : "AP " + WiFi.softAPIP().toString());
-    drawLine(12, servingTime ? "UTC " + formatUtc(nowUsec).substring(11) : "NTP gated: no GPS");
-    drawLine(24, servingTime ? "LOC " + formatLocal(nowUsec).substring(11) : "LOC not synced");
-    drawLine(36, String("GPS ") + (gpsFix ? "fix" : "no fix") + " PPS " + (hasRecentPps() ? "lock" : "wait"));
-    drawLine(48, String("NTP ") + ntpRequestCount + "/" + ntpSuppressedCount + " DNS " + dnsQueryCount);
-  } else if (oledPage == 1) {
-    drawTimePage("UTC", servingTime ? formatUtc(nowUsec) : "", servingTime);
-  } else if (oledPage == 2) {
-    drawTimePage("Local Time", servingTime ? formatLocal(nowUsec) : "", servingTime);
-  } else if (oledPage == 3) {
-    String grid = gpsFix ? maidenhead(gps.location.lat(), gps.location.lng()) : "";
-    display.setTextAlignment(TEXT_ALIGN_LEFT);
-    display.setFont(ArialMT_Plain_10);
-    drawLine(0, "Grid Square");
-    drawCentered(17, grid.length() ? grid : "--", ArialMT_Plain_24);
-    display.setFont(ArialMT_Plain_10);
-    drawCentered(48, gpsFix ? "GPS fix" : "waiting for fix", ArialMT_Plain_10);
-  } else if (oledPage == 4) {
-    drawText(0, String("Sat ") + (gps.satellites.isValid() ? gps.satellites.value() : 0) + " DOP " + gpsDopString(), ArialMT_Plain_16);
-    drawText(16, gpsFix ? "Lat " + String(gps.location.lat(), 4) : "Lat --", ArialMT_Plain_16);
-    drawText(32, gpsFix ? "Lon " + String(gps.location.lng(), 4) : "Lon --", ArialMT_Plain_16);
-    drawText(48, gpsFix && gps.altitude.isValid() ? "Alt " + String(gps.altitude.meters(), 0) + "m" : "Alt --", ArialMT_Plain_16);
-  } else if (oledPage == 5) {
-    drawLine(0, networkMode == NetworkMode::Sta ? "Network client" : "Standalone AP");
-    drawScrollingText(12, networkMode == NetworkMode::Sta ? WiFi.SSID() : expandedApSsid(), ArialMT_Plain_10);
-    drawLine(24, networkMode == NetworkMode::Sta ? WiFi.localIP().toString() : WiFi.softAPIP().toString());
-    drawLine(36, String("Clients ") + (networkMode == NetworkMode::ApFallback ? WiFi.softAPgetStationNum() : 0) + "/" + settings.apMaxClients);
-    drawScrollingText(48, "Pass " + apPasswordForDisplay(), ArialMT_Plain_10);
-  } else {
-    drawText(0, powerState.batteryPresent ? String("Bat ") + powerState.batteryMv + "mV" : "No battery", ArialMT_Plain_16);
-    drawText(16, String("I ") + String(powerState.batteryCurrentMa, 0) + "mA", ArialMT_Plain_16);
-    drawText(32, powerState.vbusPresent ? String("USB ") + powerState.vbusMv + "mV" : "USB absent", ArialMT_Plain_16);
-    drawText(48, powerState.warning ? String("Bat warning") : String("Temp ") + String(powerState.temperatureC, 0) + "C", ArialMT_Plain_16);
-  }
-
-  drawLowBatteryOverlay();
-  display.display();
+  drawOledPage(nowUsec, servingTime, gpsFix);
 }
 
 static void handleUserButton() {
@@ -2511,6 +3056,7 @@ void setup() {
     Serial.println("LittleFS mount failed");
   }
   loadSettings();
+  refreshLittleFsPresenceFlags();
 
   beginPower();
   delay(100);
