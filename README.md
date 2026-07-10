@@ -1,22 +1,31 @@
 # T-Beam GPS Disciplined NTP Server
 
-Firmware for a LilyGo/TTGO T-Beam v1.1 used as a GPS/PPS disciplined standalone IPv4 NTP server.
 
-The primary audience is the ham radio community and anyone else who needs accurate local network time in remote, austere, or off-grid conditions. The device can run as its own WiFi access point, DHCP server, DNS helper, captive portal, and NTP server, or it can join an existing LAN as a normal WiFi client.
+There are a great number of Lilygo / T-Beams out there from disappointing Meshtastic experiments. Now's a chance to give them new purpose. They've got a nice form factor, run on batteries, have screens, GPS antennas and can fit in pockets if you pull off the external antenna. 
 
-NTP itself is always UTC. Local time and daylight-saving settings only affect the captive portal and OLED display.
+This is firmware speciffically for the LilyGo/TTGO T-Beam v1.1. It turns it into a GPS/PPS disciplined standalone Stratum 1 NTP server.
+
+The primary audience is the ham radio community and anyone else who needs accurate, stratum 1 local network time in remote, austere, or off-grid environments. The device can run as its own WiFi access point, DHCP server, DNS helper, captive portal, and NTP server, or it can join an existing LAN as a normal WiFi client.
+
+NTP itself is always UTC. Local time and daylight-saving settings only affect the captive portal and OLED display. As such, they're completely safe to ignore.
 
 ## What It Does
 
 - Serves NTP on UDP/123 from GPS time, disciplined by the GPS PPS input on `GPIO37`.
+
 - Fails closed: if recent GPS time is not available, NTP requests are counted but no time is handed out.
-- Runs standalone AP mode by default at `192.168.4.1`.
-- In AP mode, DHCP can advertise the T-Beam itself as the NTP server with DHCP option 42.
-- In AP mode, local DNS can answer common public NTP hostnames with the T-Beam IP.
+
+- Runs standalone AP mode by default at `192.168.4.1`. Can be changed.
+
+- In AP mode, DHCP can advertise the T-Beam itself as the NTP server with DHCP option 42. Not every client will listen.
+
+- In AP mode, local DNS can answer common public NTP hostnames with the T-Beam IP. Option to respond to EVERY DNS request too (Useful?)
+
 - Provides a captive portal for WiFi onboarding, AP settings, NTP alias settings, display settings, local time settings, and conservative Li-Ion power settings.
 
 - Shows GPS, UTC, local time, Grid Square / Maidenhead locator, WiFi, and power status on the onboard OLED.
-- Never transmits LoRa. Bluetooth is not used by the firmware.
+
+- Never transmits LoRa. OK to disconnect the antenna. Bluetooth is not used by the firmware.
 
 ## Current Build
 
@@ -71,7 +80,7 @@ NTP intentionally fails closed: requests are counted but no NTP response is sent
 
 The T-Beam can also join an existing WiFi network by selecting Client Mode with AP Fallback in the portal and entering the Network Client SSID/password. In client mode it serves NTP on its assigned or static IPv4 address. Your router or clients can then be configured to use the T-Beam IP or hostname as an NTP source. DHCP and DNS servers are inactive, since it's assumed that the local router will be handling these services. If the client connection fails or is later lost, the device falls back to standalone AP mode.
 
-Standalone AP security is configurable as Open, WPA2-Personal, WPA/WPA2 legacy, WPA2/WPA3 transition, or WPA3-Personal. WEP is not exposed because ESP32 SoftAP mode does not support WEP.
+Standalone AP security is configurable as Open, WPA2-Personal, WPA/WPA2 legacy, WPA2/WPA3 transition, or WPA3-Personal. WEP sucks and ESP32 SoftAP doesn't support it anyway.
 
 ## Hardware Assumptions
 
@@ -93,13 +102,13 @@ UTC comes from GPS. Local display time is display-only and does not affect NTP. 
 
 The timezone preset file is deliberately separate from the firmware logic. It is generated from IANA tzdata `2026c`, current as of July 9, 2026, and omits historical transitions. It can be edited, replaced, or removed; fixed-offset and manual POSIX modes still work without it.
 
-The default timezone preset is `America/Los_Angeles`. The fallback/manual POSIX rule is US Pacific time:
+The default timezone preset is `America/Los_Angeles`. The fallback/manual POSIX rule is US Pacific time, because Hollywood is the center of the universe. 
 
 ```text
 PST8PDT,M3.2.0/2,M11.1.0/2
 ```
 
-That means standard time is PST, daylight time is PDT, DST begins on the second Sunday in March at 02:00, and DST ends on the first Sunday in November at 02:00.
+If you want to decode this, you'll see that it means standard time is PST, daylight time is PDT, DST begins on the second Sunday in March at 02:00, and DST ends on the first Sunday in November at 02:00.
 
 Examples:
 
@@ -107,11 +116,11 @@ Examples:
 - US Mountain without DST, such as most of Arizona: `MST7`
 - UTC: `UTC0`
 
-The firmware does not carry a full historical IANA TZif database. That is intentional: for this device, local time is for the OLED and portal, while NTP remains UTC.
+The firmware does not carry a full historical IANA TZif database, because that would be pretty useless. Anyway, local time is for the OLED and portal, while NTP remains UTC.
 
 ## OLED And Button
 
-The OLED cycles screens every 5 seconds by default. The cycle setting and screensaver timeout are configurable in the portal. Manual cycling pauses automatic cycling for 30 seconds; the screensaver timeout still applies normally.
+The OLED cycles screens every 5 seconds by default.  There's a configurable screensaver timeout.
 
 The user button wakes the screen. A short press cycles screens when the display is awake.
 
@@ -122,6 +131,8 @@ Factory Reset
 
 ## Power Defaults
 
+**Do NOT use LiFePO4 batteries in any T-Beam.**
+
 Defaults are conservative for a single Li-Ion cell:
 
 - Charging enabled
@@ -129,19 +140,22 @@ Defaults are conservative for a single Li-Ion cell:
 - Charge target: 4.10 V
 - USB/VBUS input current limit: 500 mA
 - Battery warning: 3.50 V while discharging
-- Battery cutoff: 3.20 V while discharging, after a 30 second debounce
-- AXP192 system power-down threshold: 3.00 V
+- Battery cutoff: 3.20 V while discharging - When the system shuts down. 
+- AXP192 system power-down threshold: 3.00 V - This is the voltage at which the battery is so dead that the system stops monitoring it and permanent battery damage is imminent. 
 
-Low-voltage shutdown is only requested when the PMU reports that a battery is present and discharging, so USB-only operation without a battery is expected to work.
+Low-voltage shutdown is only requested when the PMU reports that a battery is present and discharging, so USB-only operation without a battery works fine.
 
 ## WiFi Client Capacity
 
 The ESP32 IDF headers expose a larger SoftAP station table, while the Arduino `WiFi.softAP()` comments still describe 1-4 clients. This firmware exposes a UI range of 1-10 and defaults to 8.
 
-For low-rate DHCP/DNS/NTP traffic, 8 clients is a reasonable starting point on this board. More may work, but the practical limit should be validated with real clients because WiFi management buffers, retries, RSSI, and captive-portal HTTP traffic matter more than NTP bandwidth.
+For low-rate DHCP/DNS/NTP traffic, 8 clients is a reasonable starting point on this board. More may work, but the practical limit should be validated with real clients because WiFi management buffers, retries, RSSI, and captive-portal HTTP traffic matter more than NTP bandwidth. If you notice problems or unstable behavior, it may be worth lowering this limit. 
 
 ## Known Limitations
 
-- Timezone presets are current-as-of data, not a historical IANA TZif database.
-- PPS discipline is implemented in firmware using GPS NMEA plus the PPS interrupt. It is suitable for this embedded NTP role, but it is not a full temperature-compensated oscillator PLL.
-- DHCP option 42 is configured through the ESP32 lwIP DHCP server option hook. Some clients do not visibly report received option 42 even when they accept the DHCP lease.
+- Timezone is entirely a cosmetic OLED "Nice to have" - The presets are current-as-of data, not a historical IANA TZ database. 
+- PPS discipline is implemented in firmware using GPS NMEA plus the PPS interrupt. It is suitable for this embedded NTP role, but it is not a full temperature-compensated oscillator PLL. 
+- It's only IPv4 - Is this really a problem?
+- DHCP option 42 is configured through the ESP32 lwIP DHCP server option hook. Some clients don't visibly report received option 42 even when they accept the DHCP lease, and there's no guarantee that they're going to do anything with it if they do take it, hence the DNS wildcards. 
+- The current builds are unsuitable for other T-Beam revisions outside the 1.1 T-Beam hardware as of v0.1.8 - This is due to different power handling ICs throughout the product line. This could be a "bad thing" since lithium batteries are involved.  The author doesn't have access to other hardware for testing. 
+- Power usage hasn't been optimized. 
