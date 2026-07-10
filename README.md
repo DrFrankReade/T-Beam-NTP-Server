@@ -31,7 +31,7 @@ NTP itself is always UTC. Local time and daylight-saving settings only affect th
 
 ## Current Build
 
-- Firmware version: `v0.1.9`
+- Firmware version: `v0.1.10`
 - PlatformIO environment: `ttgo-t-beam`
 - Upload port: `COM28`
 - Filesystem: LittleFS, 1 MB at `0x300000`
@@ -59,7 +59,7 @@ $env:PYTHONIOENCODING='utf-8'
 GitHub releases include a single combined image named like:
 
 ```text
-t-beam-ntp-server-v0.1.9-combined.bin
+t-beam-ntp-server-v0.1.10-combined.bin
 ```
 
 This image includes the bootloader, partition table, boot app data, firmware, and LittleFS portal/settings defaults. Flashing it is intentionally simple and will erase the previous contents of the device, including saved settings.
@@ -74,14 +74,14 @@ Then flash the combined image. Replace `COM28` with your serial port:
 
 ```powershell
 py -m esptool --chip esp32 --port COM28 --baud 460800 erase_flash
-py -m esptool --chip esp32 --port COM28 --baud 460800 write_flash -z 0x0 t-beam-ntp-server-v0.1.9-combined.bin
+py -m esptool --chip esp32 --port COM28 --baud 460800 write_flash -z 0x0 t-beam-ntp-server-v0.1.10-combined.bin
 ```
 
 If you already have PlatformIO installed, its bundled esptool also works:
 
 ```powershell
 & "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" -m esptool --chip esp32 --port COM28 --baud 460800 erase_flash
-& "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" -m esptool --chip esp32 --port COM28 --baud 460800 write_flash -z 0x0 t-beam-ntp-server-v0.1.9-combined.bin
+& "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" -m esptool --chip esp32 --port COM28 --baud 460800 write_flash -z 0x0 t-beam-ntp-server-v0.1.10-combined.bin
 ```
 
 After flashing, reset the board and join the default AP shown below.
